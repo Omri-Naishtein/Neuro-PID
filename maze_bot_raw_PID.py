@@ -45,7 +45,7 @@ GYRO_DEADBAND  = 1.0
 
 # ── PID GAINS (from working version) ─────────────────────────────────────────
 HEAD_KP, HEAD_KI, HEAD_KD = 2.0,  0.15, 0.05   # heading correction
-DIST_KP, DIST_KI, DIST_KD = 80.0, 0.5,  8.0    # distance → speed
+DIST_KP, DIST_KI, DIST_KD = 80.0, 0.5,  8.0    # distance → speed DIST_KP CAN ALSO BE 70
 TURN_KP, TURN_KI, TURN_KD = 2.0,  0.3,  0.7    # 90° rotation
 
 
