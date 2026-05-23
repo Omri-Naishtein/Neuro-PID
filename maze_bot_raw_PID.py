@@ -18,13 +18,15 @@ IN2_LINE = 113
 IN3_LINE = 52
 IN4_LINE = 51
 
-# ── PARAMETERS ────────────────────────────────────────────────────────────────
+# ── PARAMETERS (from working version) ────────────────────────────────────────
 PWM_MAX        = 75       # motor cap (%)
 CRUISE_PWM     = 60       # max forward speed
 MIN_PWM        = 25       # minimum motor speed — lower so it can creep near wall
 
-STOP_DIST      = 0.3    # m — stop earlier to absorb momentum
-CONFIRM_SCANS  = 2        # react faster to wall
+STOP_DIST      = 0.20     # m — full stop
+CREEP_DIST     = 0.40     # m — below this, fixed 30% power
+CREEP_PWM      = 30       # fixed motor power in creep zone
+CONFIRM_SCANS  = 2        # require 2 scans to confirm wall
 WAIT_SECONDS   = 2.0      # pause before turning
 
 TURN_ANGLE_DEG = 90.0
@@ -33,17 +35,17 @@ TURN_TIMEOUT   = 6.0
 
 IMU_CALIB_TIME = 5.0      # seconds to calibrate gyro offset
 
-FRONT_CONE_DEG = 20.0
-MAX_RANGE      = 2.0
-
-BRAKE_ZONE     = 0.40     # metres before wall where speed scaling begins
+# ── LIDAR CONE WIDTHS (degrees half-angle each side) ──────────────────────────
+FRONT_CONE_DEG = 5.0      # ±5° narrow cone ahead
+SIDE_CONE_DEG  = 5.0      # ±5° cone for left/right sensing
+MAX_RANGE      = 2.0      # ignore returns beyond this (m)
 
 # deadband for gyro rate (deg/s)
 GYRO_DEADBAND  = 1.0
 
-# ── PID GAINS ─────────────────────────────────────────────────────────────────
+# ── PID GAINS (from working version) ─────────────────────────────────────────
 HEAD_KP, HEAD_KI, HEAD_KD = 2.0,  0.15, 0.05   # heading correction
-DIST_KP, DIST_KI, DIST_KD = 30.0, 0.5,  8.0    # distance → speed (Kd brakes early)
+DIST_KP, DIST_KI, DIST_KD = 80.0, 0.5,  8.0    # distance → speed
 TURN_KP, TURN_KI, TURN_KD = 2.0,  0.3,  0.7    # 90° rotation
 
 
@@ -57,6 +59,10 @@ def clamp(x, lo, hi):
 def wrap_angle(a):
     """Wrap to [-180, 180]."""
     return (a + 180.0) % 360.0 - 180.0
+
+def wrap_rad(a):
+    """Wrap angle to [-pi, pi] radians."""
+    return (a + math.pi) % (2 * math.pi) - math.pi
 
 
 # ── PID ───────────────────────────────────────────────────────────────────────
@@ -139,11 +145,16 @@ class Robot(Node):
         self.heading       = 0.0
         self.imu_ready     = False
 
-        # lidar
-        self.latest_dist = float("inf")
-        self.cone = math.radians(FRONT_CONE_DEG)
+        # ── lidar distances (three cones, updated every scan) ─────────────
+        self.dist_front = float("inf")
+        self.dist_left  = float("inf")
+        self.dist_right = float("inf")
 
-        # state machine: INIT → FORWARD → WAIT → TURN → FORWARD (circular)
+        self.cone_front = math.radians(FRONT_CONE_DEG)
+        self.cone_side  = math.radians(SIDE_CONE_DEG)
+
+        # ── state machine ─────────────────────────────────────────────────
+        # INIT -> FORWARD -> WAIT -> DECIDE -> TURN -> FORWARD (repeat)
         self.state           = "INIT"
         self.start_heading   = 0.0
         self.turn_target     = 0.0
@@ -197,37 +208,81 @@ class Robot(Node):
             corrected = 0.0
         self.heading += corrected * dt
 
-    # ── LIDAR CALLBACK ────────────────────────────────────────────────────
-    # lidar is mounted backwards — front of robot = back of lidar (±π)
+    # ── LIDAR CALLBACK (three ±5° cones, sensor mounted 180° flipped) ────
     def scan_cb(self, msg):
-        min_d = float("inf")
-        for i, r in enumerate(msg.ranges):
-            angle = msg.angle_min + i * msg.angle_increment
-            angle = (angle + math.pi) % (2 * math.pi) - math.pi
-            if (math.pi - abs(angle)) > self.cone:
-                continue
-            if math.isfinite(r) and r > 0.0 and r < msg.range_min:
-                min_d = 0.0
-                break
-            if not math.isfinite(r):                   continue
-            if r < msg.range_min or r > msg.range_max: continue
-            if r > MAX_RANGE:                          continue
-            if r < min_d:
-                min_d = r
-        self.latest_dist = min_d
+        front_min = float("inf")
+        left_min  = float("inf")
+        right_min = float("inf")
 
-    # ── CONTROL LOOP ──────────────────────────────────────────────────────
+        half_pi = math.pi / 2.0
+
+        for i, r in enumerate(msg.ranges):
+            if not math.isfinite(r):                    continue
+            if r < msg.range_min or r > msg.range_max:  continue
+            if r > MAX_RANGE:                           continue
+
+            raw_angle = msg.angle_min + i * msg.angle_increment
+            angle     = wrap_rad(raw_angle + math.pi)
+
+            if abs(angle) <= self.cone_front:
+                if r < front_min:
+                    front_min = r
+            elif abs(angle - half_pi) <= self.cone_side:
+                if r < left_min:
+                    left_min = r
+            elif abs(angle + half_pi) <= self.cone_side:
+                if r < right_min:
+                    right_min = r
+
+        if front_min < float("inf"):
+            self.dist_front = front_min
+        if left_min < float("inf"):
+            self.dist_left  = left_min
+        if right_min < float("inf"):
+            self.dist_right = right_min
+
+    # ── INTERSECTION DECISION ─────────────────────────────────────────────
+    def _decide_direction(self):
+        f = self.dist_front
+        l = self.dist_left
+        r = self.dist_right
+
+        print(f"  Intersection scan -> front={f*100:.0f}cm  "
+              f"left={l*100:.0f}cm  right={r*100:.0f}cm")
+
+        ALL_BLOCKED_CM = 0.30
+
+        all_blocked = (f < ALL_BLOCKED_CM and
+                       l < ALL_BLOCKED_CM and
+                       r < ALL_BLOCKED_CM)
+
+        if all_blocked:
+            print("  Decision: TURN BACK (180)")
+            return 180.0
+
+        if f >= l and f >= r:
+            print("  Decision: GO STRAIGHT")
+            return 0.0
+
+        if l >= r:
+            print("  Decision: TURN LEFT (+90)")
+            return 90.0
+
+        print("  Decision: TURN RIGHT (-90)")
+        return -90.0
+
+    # ── CONTROL LOOP (forward logic from working version) ─────────────────
     def control(self):
         if not self.imu_ready:
             return
 
         heading = self.heading
 
-        # ── FORWARD: drive straight + slow down near wall ─────────────────
+        # ── FORWARD: PID far away, fixed 30% near wall ───────────────────
         if self.state == "FORWARD":
 
             # wall arrival check (debounced)
-            if self.latest_dist <= STOP_DIST:
+            if self.dist_front <= STOP_DIST:
                 self.obstacle_count += 1
             else:
                 self.obstacle_count = 0
@@ -236,64 +291,70 @@ class Robot(Node):
                 self._stop_motors()
                 self.pause_until = time.monotonic() + WAIT_SECONDS
                 self.state = "WAIT"
-                print(f"Wall at {self.latest_dist*100:.1f} cm — waiting {WAIT_SECONDS:.0f} s")
+                print(f"Wall at {self.dist_front*100:.1f} cm — waiting {WAIT_SECONDS:.0f} s")
                 return
 
-            # ── Speed PID with brake-zone scaling ─────────────────────────
-            # In the last BRAKE_ZONE metres the effective speed cap shrinks
-            # linearly so the robot arrives slow regardless of PID output.
-            dist_err = self.latest_dist - STOP_DIST
-
-            if self.latest_dist < BRAKE_ZONE:
-                scale        = self.latest_dist / BRAKE_ZONE   # 0.0 → 1.0
-                effective_max = max(MIN_PWM, CRUISE_PWM * scale)
+            # ── Speed: PID when far, fixed creep when close ───────────────
+            if self.dist_front > CREEP_DIST:
+                # normal PID
+                dist_err = self.dist_front - STOP_DIST
+                speed = self.pid_dist.step(dist_err)
+                speed = clamp(speed, MIN_PWM, CRUISE_PWM)
             else:
-                effective_max = CRUISE_PWM
+                # creep zone (40 cm → 20 cm): fixed 30% power
+                self.pid_dist.reset()
+                speed = CREEP_PWM
 
-            speed = self.pid_dist.step(dist_err)
-            speed = clamp(speed, 0, effective_max)             # respect scaled cap
-
-            # Enforce MIN_PWM only when NOT dangerously close to the wall
-            if 0 < speed < MIN_PWM and self.latest_dist > STOP_DIST + 0.05:
-                speed = MIN_PWM
-
-            # ── Heading PID keeps the robot driving straight ───────────────
+            # ── Heading PID keeps the robot driving straight ──────────────
             head_err   = self.start_heading - heading
             correction = self.pid_head.step(head_err)
 
-            # ┌──────────────────────────────────────────────────────────────┐
-            # │  If the robot STILL circles, swap the + and − below:        │
-            # │     left  = clamp(speed - correction, 0, PWM_MAX)           │
-            # │     right = clamp(speed + correction, 0, PWM_MAX)           │
-            # └──────────────────────────────────────────────────────────────┘
             left  = clamp(speed + correction, 0, PWM_MAX)
             right = clamp(speed - correction, 0, PWM_MAX)
+            zone = "CREEP" if self.dist_front <= CREEP_DIST else "PID"
+            print(f"[{zone}] dist={self.dist_front*100:.0f}cm  speed={speed:.0f}%  "
+                  f"steering={correction:+.0f}  L={left:.0f}%  R={right:.0f}%")
             self._drive_forward(left, right)
             return
 
-        # ── WAIT: stop for WAIT_SECONDS ───────────────────────────────────
+        # ── WAIT: stop for WAIT_SECONDS, then decide ──────────────────────
         if self.state == "WAIT":
             self._stop_motors()
             if time.monotonic() >= self.pause_until:
-                self.turn_target     = heading + TURN_ANGLE_DEG
+                self.state = "DECIDE"
+            return
+
+        # ── DECIDE: read all three cones, pick the best direction ─────────
+        if self.state == "DECIDE":
+            delta = self._decide_direction()
+
+            if delta == 0.0:
+                self.start_heading  = heading
+                self.obstacle_count = 0
+                self.pid_head.reset()
+                self.pid_dist.reset()
+                self.state = "FORWARD"
+                print("Going straight through intersection")
+            else:
+                self.turn_target     = heading + delta
                 self.turn_started_at = time.monotonic()
                 self.pid_turn.reset()
                 self.state = "TURN"
-                print("Starting 90° turn")
+                print(f"Turning {delta:+.0f}  (target heading = {self.turn_target:.1f})")
             return
 
-        # ── TURN: rotate 90° in place ─────────────────────────────────────
+        # ── TURN: rotate to target heading ────────────────────────────────
         if self.state == "TURN":
-            error = self.turn_target - heading
+            error = wrap_angle(self.turn_target - heading)
 
             if abs(error) < TURN_DONE_DEG:
                 self._stop_motors()
-                self.start_heading  = heading   # new reference for next straight leg
+                self.start_heading  = heading
                 self.obstacle_count = 0
-                self.pid_head.reset()           # clear heading integrator for new leg
-                self.pid_dist.reset()           # clear distance integrator for new leg
+                self.pid_head.reset()
+                self.pid_dist.reset()
                 self.state = "FORWARD"
-                print(f"Turn complete  (heading = {heading:.1f}°) → forward again")
+                print(f"Turn complete  (heading = {heading:.1f}) -> forward")
                 return
 
             if time.monotonic() - self.turn_started_at > TURN_TIMEOUT:
@@ -303,7 +364,7 @@ class Robot(Node):
                 self.pid_head.reset()
                 self.pid_dist.reset()
                 self.state = "FORWARD"
-                print(f"Turn timeout  (error = {error:.1f}°) → forward anyway")
+                print(f"Turn timeout  (error = {error:.1f}) -> forward anyway")
                 return
 
             cmd = self.pid_turn.step(error)
