@@ -111,6 +111,8 @@ class PID:
     The caller is responsible for computing the error before each call:
         - Linear:  error = setpoint − measurement
         - Angular: error = angle_diff(target, yaw)
+          … or set ``angular=True`` and pass the raw error — it will be
+          wrapped to (−180, +180] automatically.
 
     The `setpoint` parameter is informational only (shown in the banner).
     The controller always operates on the pre-computed error you pass in.
@@ -118,12 +120,19 @@ class PID:
     Parameters
     ----------
     setpoint        : float  – displayed in banner; not used in math
+    angular         : bool   – if True, auto-wrap error via angle_diff()
+                               so the caller can pass (target, measurement)
+                               directly instead of pre-computing wrapping
+                               (default False)
     zeta            : float  – damping ratio                   (default 0.7)
     omega_n         : float  – natural frequency  [rad/s]      (default 3.0)
     mass            : float  – inertia / gain scaling          (default 1.0)
     gamma           : float  – derivative pre-filter zero      (default ω₀/10)
     d_alpha         : float  – derivative low-pass coefficient (default 0.15)
-                               0 → pure derivative, 1 → derivative off
+                               1 → trust new sample fully (no filtering)
+                               0 → ignore new sample (derivative off)
+                               NOTE: higher α = less smoothing, which is the
+                               inverse of some textbook conventions.
     output_max      : float  – maximum output magnitude        (default 60)
     output_min      : float  – minimum non-zero output         (default 9)
     imax            : float  – integrator anti-windup clamp    (default 20)
@@ -132,6 +141,8 @@ class PID:
                                (default 12, same units as error)
     slow_output_max : float  – output cap inside slow zone     (default 28)
     done_threshold  : float  – |error| below which done=True   (default 1.5)
+    done_dwell      : int    – consecutive samples inside done_threshold
+                               before done is actually set      (default 3)
     max_slew        : float  – max output change per step      (default 16)
     max_samples     : int    – telemetry ring-buffer size       (default 10 000)
     feedback        : bool   – stream telemetry to terminal    (default True)
@@ -144,6 +155,7 @@ class PID:
     def __init__(
         self,
         setpoint: float = 0.0,
+        angular: bool = False,
         zeta: float = 0.7,
         omega_n: float = 3.0,
         mass: float = 1.0,
@@ -156,6 +168,7 @@ class PID:
         slow_zone: float = 12.0,
         slow_output_max: float = 28.0,
         done_threshold: float = 1.5,
+        done_dwell: int = 3,
         max_slew: float = 16.0,
         max_samples: int = 10_000,
         feedback: bool = True,
@@ -164,6 +177,7 @@ class PID:
         label: str = "",
     ):
         self.setpoint        = setpoint
+        self.angular         = angular
         self.zeta            = zeta
         self.omega_n         = omega_n
         self.mass            = mass
@@ -175,6 +189,7 @@ class PID:
         self.slow_zone       = slow_zone
         self.slow_output_max = slow_output_max
         self.done_threshold  = done_threshold
+        self.done_dwell      = done_dwell
         self.max_slew        = max_slew
         self.max_samples     = max_samples
         self.feedback        = feedback
@@ -199,6 +214,7 @@ class PID:
         self._last_step_time  : Optional[float] = None
         self._t0              : Optional[float] = None
         self.done             : bool            = False
+        self._done_count      : int             = 0
 
         # ── telemetry ring-buffers (bounded memory) ──
         self._times    : deque[float] = deque(maxlen=max_samples)
@@ -231,6 +247,7 @@ class PID:
         self._last_step_time  = None
         self._t0              = None
         self.done             = False
+        self._done_count      = 0
 
         if clear_telemetry:
             for buf in (self._times, self._errors, self._p_terms,
@@ -248,15 +265,23 @@ class PID:
 
         Parameters
         ----------
-        raw_error  : error = setpoint − measurement (or angle_diff for angular)
+        raw_error  : error = setpoint − measurement (or angle_diff for angular).
+                     If ``angular=True`` was set at construction, the error is
+                     automatically wrapped to (−180, +180] via angle_diff().
         timestamp  : monotonic time of this sample; auto-filled if None
 
         Returns
         -------
-        float  – signed output.
-                 |output| ≥ output_min when active, 0.0 when done.
+        float  – signed output whose absolute value is at least ``output_min``
+                 when the controller is active, or 0.0 when done.
                  Positive → one direction, negative → the other.
         """
+        # ── angular wrapping (if enabled) ─────────────────────────────────────
+        if self.angular:
+            raw_error = angle_diff(raw_error, 0.0)
+            # When angular=True the caller passes the pre-subtracted error,
+            # so wrapping it against 0 normalises the range.
+
         if timestamp is None:
             timestamp = time.monotonic()
 
@@ -278,15 +303,23 @@ class PID:
             else self._min_dt
         )
         dt = max(dt, 1e-4)          # guard against zero / negative dt
+        is_first_step = self._last_step_time is None
         self._last_step_time = timestamp
 
-        # ── done check on raw error (no filter lag on the stop decision) ──────
+        # ── done check with dwell — error must stay below threshold for
+        #    done_dwell consecutive samples before we declare convergence ──────
         if abs(raw_error) < self.done_threshold:
-            self.done = True
-            self._record(t, raw_error, 0.0, 0.0, 0.0, 0.0, 0.0)
-            if self.feedback:
-                print(f"  [DONE] t={t:.3f}s  err={raw_error:+.2f}")
-            return 0.0
+            self._done_count += 1
+            if self._done_count >= self.done_dwell:
+                self.done = True
+                self._integral = 0.0          # clear stale integrator
+                self._record(t, raw_error, 0.0, 0.0, 0.0, 0.0, 0.0)
+                if self.feedback:
+                    print(f"  [DONE] t={t:.3f}s  err={raw_error:+.2f}"
+                          f"  (settled for {self._done_count} samples)")
+                return 0.0
+        else:
+            self._done_count = 0
 
         # ── P term  (raw error — no filter lag) ───────────────────────────────
         p = self.Kp * raw_error
@@ -316,15 +349,25 @@ class PID:
         limit      = self.slow_output_max if abs(raw_error) < self.slow_zone else self.output_max
         raw_output = max(-limit, min(limit, raw_output))
 
-        # ── slew-rate limiter ─────────────────────────────────────────────────
-        output = max(
-            self._last_output - self.max_slew,
-            min(self._last_output + self.max_slew, raw_output),
-        )
+        # ── slew-rate limiter (bypassed on first step so the controller
+        #    can deliver a full proportional kick immediately) ─────────────────
+        if is_first_step:
+            output = raw_output
+        else:
+            output = max(
+                self._last_output - self.max_slew,
+                min(self._last_output + self.max_slew, raw_output),
+            )
         self._last_output = output
 
-        # ── motor speed: unsigned, floored so motors don't stall ──────────────
-        speed = max(abs(output), self.output_min)
+        # ── apply output_min floor: ensure |output| ≥ output_min so that
+        #    motors / actuators never receive a sub-stall command ──────────────
+        if output > 0.0:
+            output = max(output, self.output_min)
+        elif output < 0.0:
+            output = min(output, -self.output_min)
+
+        speed = abs(output)
 
         self._record(t, raw_error, p, i, d, output, speed)
 
@@ -491,6 +534,8 @@ class PID:
         print(f"  Output range         = [{self.output_min}, {self.output_max}]")
         print(f"  Slow zone  < {self.slow_zone}  → max = {self.slow_output_max}")
         print(f"  Done threshold       = ±{self.done_threshold}")
+        print(f"  Done dwell           = {self.done_dwell} samples")
+        print(f"  Angular mode         = {self.angular}")
         print(f"  Max slew / step      = {self.max_slew}")
         print(f"  Update cap           = {self.pid_hz} Hz")
         print(f"  Setpoint (display)   = {self.setpoint}")
