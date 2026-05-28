@@ -481,102 +481,31 @@ class _TinyMLP:
 # ═════════════════════════════════════════════════════════════════════════════
 #  System models for zeta (ζ) estimation
 # ═════════════════════════════════════════════════════════════════════════════
-#
-# These functions compute the effective damping ratio of the closed-loop
-# system given the current adaptive gains (Kp, Kd) and the known plant
-# parameters.  Each model corresponds to a standard transfer-function form
-# from control theory.
-#
-# ── "mass" model ────────────────────────────────────────────────────────────
-#   Plant: G(s) = 1 / (m·s² + b·s)
-#   This is a rigid body (mass m) with viscous friction (damping b) driven
-#   by a force.  With PD control the closed-loop characteristic equation is:
-#
-#       m·s² + (b + Kd)·s + Kp = 0
-#
-#   Comparing to the standard form  s² + 2ζω₀s + ω₀² = 0  gives:
-#
-#       ω₀ = sqrt(Kp / m)
-#       ζ  = (b + Kd) / (2 · sqrt(m · Kp))
-#
-# ── "dc_motor" model ───────────────────────────────────────────────────────
-#   Plant: G(s) = K / (τ·s + 1)
-#   A first-order motor with gain K and time constant τ.  With PD control
-#   the closed-loop becomes second-order:
-#
-#       τ·s² + (1 + K·Kd)·s + K·Kp = 0
-#
-#   Dividing by τ and matching to the standard form:
-#
-#       ω₀ = sqrt(K · Kp / τ)
-#       ζ  = (1 + K · Kd) / (2 · sqrt(τ · K · Kp))
-#
-# Both functions return a clamped float in [0.0, 10.0] and gracefully
-# handle degenerate inputs (Kp ≤ 0, mass ≤ 0, etc.) by returning 0.0.
-# ═════════════════════════════════════════════════════════════════════════════
 
-# Upper clamp for zeta — values above this are meaninglessly overdamped and
-# would create outsized gradient signals if left uncapped.
 _ZETA_MAX = 2
-
-# Minimum denominator to avoid division-by-zero in the zeta formulas.
 _ZETA_EPS = 1e-12
 
 
 def _zeta_mass(kp, kd, mass, damping):
-    """Compute ζ for a mass-spring-damper plant: G(s) = 1/(ms²+bs).
-
-    Parameters
-    ----------
-    kp : float      Current proportional gain.
-    kd : float      Current derivative gain.
-    mass : float    System mass (kg).
-    damping : float Viscous damping coefficient (N·s/m).
-
-    Returns
-    -------
-    float   Effective damping ratio, clamped to [0.0, _ZETA_MAX].
-    """
     if kp <= 0.0 or mass <= 0.0:
         return 0.0
-
     denom = 2.0 * math.sqrt(mass * kp)
-
     if denom < _ZETA_EPS:
         return 0.0
-
     zeta = (damping + kd) / denom
     return _clamp(zeta, 0.0, _ZETA_MAX)
 
 
 def _zeta_dc_motor(kp, kd, motor_gain, time_constant):
-    """Compute ζ for a DC-motor plant: G(s) = K/(τs+1).
-
-    Parameters
-    ----------
-    kp : float            Current proportional gain.
-    kd : float            Current derivative gain.
-    motor_gain : float    DC gain K of the motor.
-    time_constant : float Electrical/mechanical time constant τ (seconds).
-
-    Returns
-    -------
-    float   Effective damping ratio, clamped to [0.0, _ZETA_MAX].
-    """
     if kp <= 0.0 or motor_gain <= 0.0 or time_constant <= 0.0:
         return 0.0
-
     denom = 2.0 * math.sqrt(time_constant * motor_gain * kp)
-
     if denom < _ZETA_EPS:
         return 0.0
-
     zeta = (1.0 + motor_gain * kd) / denom
     return _clamp(zeta, 0.0, _ZETA_MAX)
 
 
-# Registry mapping system_type strings to their zeta functions and the
-# plant-parameter names each one expects.
 _SYSTEM_MODELS = {
     "mass": {
         "fn": _zeta_mass,
@@ -593,38 +522,13 @@ _SYSTEM_MODELS = {
 #  NeuroPID
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Fix 17: new magic NPD4 — adds system model + zeta fields to the header.
-_PID_MAGIC = b"NPD4"
-_PID_MAGIC_V3 = b"NPD3"  # still readable for backward compat
-_PID_MAGIC_V2 = b"NPD2"  # still readable for backward compat
+_PID_MAGIC    = b"NPD4"
+_PID_MAGIC_V3 = b"NPD3"
+_PID_MAGIC_V2 = b"NPD2"
 
 
 class PID:
-    """Adaptive PID controller with neural gain tuning.
-
-    Fix 17 additions
-    ─────────────────
-    The controller now estimates the effective damping ratio (ζ) of the
-    closed-loop system at every control step and includes the deviation
-    from a user-specified target_zeta in the neural reward signal.
-
-    Two plant models are supported out of the box:
-
-      "mass"     — rigid body with viscous friction
-                   G(s) = 1 / (m·s² + b·s)
-                   ζ = (b + Kd) / (2·√(m·Kp))
-
-      "dc_motor" — first-order motor with gain and time constant
-                   G(s) = K / (τ·s + 1)
-                   ζ = (1 + K·Kd) / (2·√(τ·K·Kp))
-
-    If system_type is None (the default for backward compatibility) the
-    zeta calculation is skipped and the reward function behaves exactly
-    as before Fix 17.
-
-    The default target_zeta is 1.0 (critically damped): fastest settling
-    with zero overshoot.
-    """
+    """Adaptive PID controller with neural gain tuning."""
 
     PROFILES = {
         "low": 16,
@@ -648,32 +552,12 @@ class PID:
         clip: float = 0.03,
         seed: int = 0,
         integral_limit: float = 50.0,
-        # Fix 13: renamed from derivative_smoothing for clarity
         derivative_alpha: float = 0.15,
         frozen: bool = False,
         gain_alpha: float = 0.08,
         default_dt: float = 0.02,
-        # Fix 12: maximum dt to prevent spikes from scheduling stalls
         max_dt: float | None = None,
-        # Fix 9: power limit — now applied upstream of anti-windup
         max_output: float = 0.6,
-        # ── Fix 17: zeta-aware tuning parameters ────────────────────────
-        #
-        # target_zeta — the damping ratio the neural network should steer
-        #   the gains toward.  Default is 1.0 (critically damped):
-        #   fastest settling with zero overshoot.
-        #
-        # system_type — selects the plant model used to compute ζ from the
-        #   current adaptive gains.  None disables zeta optimisation
-        #   entirely (full backward compatibility).
-        #
-        # mass / damping — plant parameters for system_type="mass".
-        # motor_gain / time_constant — plant parameters for "dc_motor".
-        #
-        # zeta_weight — how strongly the zeta error term influences the
-        #   neural reward relative to the tracking-error and control-effort
-        #   terms.  Higher values make the MLP prioritise damping-ratio
-        #   convergence over raw error reduction.
         target_zeta: float = 1.0,
         system_type: str | None = None,
         mass: float = 1.0,
@@ -681,8 +565,16 @@ class PID:
         motor_gain: float = 1.0,
         time_constant: float = 1.0,
         zeta_weight: float = 0.2,
+        # ── Anti-windup back-calculation gain ───────────────────────────
+        # Tt (tracking time constant) controls how aggressively the
+        # integrator is wound back when the output saturates.
+        # Tt = sqrt(Ti * Td) is the classical recommendation (Åström &
+        # Hägglund), where Ti = Kp/Ki and Td = Kd/Kp.
+        # Passing None uses that automatic formula; pass an explicit
+        # float to override.
+        anti_windup_gain: float | None = None,
     ):
-        # ── Fix 15: validate constructor arguments ──────────────────────
+        # ── validate constructor arguments ──────────────────────────────
         if out_min is not None and out_max is not None and out_min >= out_max:
             raise ValueError(
                 f"out_min ({out_min}) must be less than out_max ({out_max})"
@@ -707,7 +599,6 @@ class PID:
                     f"upper bound ({hi})"
                 )
 
-        # ── Fix 17: validate system model parameters ────────────────────
         if system_type is not None and system_type not in _SYSTEM_MODELS:
             raise ValueError(
                 f"Unknown system_type '{system_type}'. "
@@ -762,7 +653,7 @@ class PID:
 
         self.integral_limit = integral_limit
 
-        # derivative filtering (Fix 13: renamed)
+        # derivative filtering
         self.derivative = 0.0
         self.derivative_alpha = derivative_alpha
 
@@ -778,15 +669,14 @@ class PID:
             hidden = self.PROFILES.get(profile, 32)
         self.profile = profile
 
-        # ── Fix 10 & 11: build feature list and derive input_dim ────────
         # Feature layout:
         #   e_hist (error_history)
         #   integral (1)
         #   derivative (1)
         #   u_hist (output_history)
         #   setpoint (1)
-        #   dt (1)                     ← was 0.0 placeholder
-        #   setpoint_error_ratio (1)   ← was 0.0 placeholder
+        #   dt (1)
+        #   setpoint_error_ratio (1)
         self._feature_len = error_history + 1 + 1 + output_history + 1 + 1 + 1
         input_dim = self._feature_len
 
@@ -804,44 +694,75 @@ class PID:
 
         self.gain_alpha = gain_alpha
         self.default_dt = default_dt
-
-        # Fix 12: dt cap — defaults to 10× default_dt
         self.max_dt = max_dt if max_dt is not None else default_dt * 10.0
-
-        # Fix 9: power limit
         self.max_output = max_output
 
-        # ── Fix 17: zeta-aware tuning state ─────────────────────────────
+        # ── Anti-windup back-calculation gain ───────────────────────────
+        # Store the user-supplied value (or None for auto).  The actual
+        # gain is recomputed in step() from the live adaptive gains so it
+        # remains correct even as Kp/Ki/Kd evolve.
+        self._aw_gain_override = anti_windup_gain
+
+        # Track the unsaturated (raw) output for back-calculation.
+        self._output_raw = 0.0
+
+        # zeta-aware tuning state
         self.target_zeta = target_zeta
         self.system_type = system_type
         self.zeta_weight = zeta_weight
 
-        # Plant parameters — stored generically so both models can coexist
-        # in the same object without conditional attribute creation.
         self.mass = mass
         self.damping = damping
         self.motor_gain = motor_gain
         self.time_constant = time_constant
 
-        # Live zeta estimate — updated every step() when system_type is set.
-        # Exposed publicly so the caller can log / display it.
         self.current_zeta = 0.0
         self.zeta_error = 0.0
 
         # bookkeeping
         self.setpoint = 0.0
         self.step_count = 0
-
-        # temporal reward
         self.prev_abs_error = 0.0
+
+    # ── Anti-windup back-calculation gain ─────────────────────────────────
+    def _aw_gain(self) -> float:
+        """Return the back-calculation gain Kaw for the current gains.
+
+        The Åström-Hägglund formula is:
+
+            Tt  = sqrt(Ti × Td)
+            Kaw = 1 / Tt
+
+        where Ti = Kp/Ki (integral time) and Td = Kd/Kp (derivative time).
+        When Ki is zero there is no integrator, so windup cannot occur;
+        Kaw = 0 is returned.
+
+        The user may pass anti_windup_gain=<float> to the constructor to
+        override this with a fixed value.
+        """
+        if self._aw_gain_override is not None:
+            return self._aw_gain_override
+
+        # Avoid division by zero: if Ki or Kp is zero, skip.
+        if self.ki < 1e-12 or self.kp < 1e-12:
+            return 0.0
+
+        Ti = self.kp / self.ki        # integral time constant
+        Td = self.kd / self.kp        # derivative time constant
+
+        if Td < 1e-12:
+            # Pure PI — use Tt = Ti (conservative)
+            Tt = Ti
+        else:
+            Tt = math.sqrt(Ti * Td)   # geometric mean (classical formula)
+
+        if Tt < 1e-12:
+            return 0.0
+
+        return 1.0 / Tt
 
     # ── Fix 17: zeta computation helper ──────────────────────────────────
     def _compute_zeta(self) -> float:
-        """Compute the effective damping ratio from current gains and plant.
-
-        Returns 0.0 if system_type is None or the calculation is invalid
-        (e.g. Kp ≤ 0).  The result is clamped to [0, _ZETA_MAX].
-        """
         if self.system_type is None:
             return 0.0
 
@@ -855,7 +776,6 @@ class PID:
                 self.kp, self.kd, self.motor_gain, self.time_constant,
             )
 
-        # Unreachable if constructor validation is correct, but safe.
         return 0.0
 
     # ── main step ────────────────────────────────────────────────────────
@@ -865,15 +785,13 @@ class PID:
         if self.prev_time is None:
             dt = self.default_dt
         else:
-            # Fix 6: wrap-safe elapsed time
             raw_dt = _elapsed(self.prev_time, now)
-            # Fix 12: clamp dt to [1ms, max_dt]
             dt = _clamp(raw_dt, 1e-3, self.max_dt)
 
         self.prev_time = now
         self.setpoint = setpoint
 
-        # ── filtered derivative (Fix 13: uses derivative_alpha) ─────────
+        # ── filtered derivative ──────────────────────────────────────────
         raw_derivative = (error - self.prev_error) / dt
 
         self.derivative = (
@@ -881,14 +799,13 @@ class PID:
             self.derivative_alpha * raw_derivative
         )
 
-        # ── Fix 10: setpoint-error ratio feature ────────────────────────
-        # Bounded to [-1, 1] to keep the feature well-scaled.
+        # ── setpoint-error ratio feature ────────────────────────────────
         if abs(setpoint) > 1e-9:
             sp_err_ratio = _clamp(error / setpoint, -1.0, 1.0)
         else:
             sp_err_ratio = _clamp(error, -1.0, 1.0)
 
-        # ── Fix 10 & 11: feature vector with no dead inputs ─────────────
+        # ── feature vector ───────────────────────────────────────────────
         feat = (
             self.e_hist +
             [self.integral, self.derivative] +
@@ -896,15 +813,13 @@ class PID:
             [setpoint, dt, sp_err_ratio]
         )
 
-        # Fix 11: assert feature length matches input_dim
         assert len(feat) == self._feature_len, (
             f"Feature length {len(feat)} != expected {self._feature_len}"
         )
 
-        # ── MLP inference ───────────────────────────────────────────────
+        # ── MLP inference ────────────────────────────────────────────────
         out = self._mlp.forward(feat)
 
-        # smooth adaptive scaling
         scale = min(2.0, 0.2 + abs(error))
         adj = [o * scale for o in out]
 
@@ -916,10 +831,7 @@ class PID:
         self.ki += self.gain_alpha * (target_ki - self.ki)
         self.kd += self.gain_alpha * (target_kd - self.kd)
 
-        # ── Fix 17: compute effective zeta from current adaptive gains ──
-        # This must happen AFTER the gains are updated but BEFORE the
-        # reward is computed, so the reward reflects the gains that
-        # actually produced this step's output.
+        # ── zeta estimate ────────────────────────────────────────────────
         self.current_zeta = self._compute_zeta()
 
         if self.system_type is not None:
@@ -927,38 +839,69 @@ class PID:
         else:
             self.zeta_error = 0.0
 
-        # ── PID computation ─────────────────────────────────────────────
-        self.integral += error * dt
+        # ── Integral update with back-calculation anti-windup ────────────
+        #
+        # Classic back-calculation (Åström & Hägglund §6.2):
+        #
+        #   dI/dt = Ki·e  +  Kaw·(u_sat − u_raw)
+        #
+        # Discrete form:
+        #
+        #   I[k] = I[k-1]  +  Ki·e·dt  +  Kaw·(u_sat[k-1] − u_raw[k-1])·dt
+        #
+        # The second term is the back-calculation correction.  When the
+        # output is NOT saturated u_sat == u_raw so the correction is zero
+        # and the integrator behaves identically to standard integration.
+        # When saturated the correction drives the integrator toward the
+        # value that would have produced exactly the saturation limit,
+        # preventing further windup.
+        #
+        # We use the *previous* step's saturation error (_output_raw was
+        # set at the end of the last step) so the update is causal.
+        #
+        # The out_min/out_max limits used here are the hardware saturation
+        # limits, NOT the soft max_output cap.  The max_output cap is a
+        # safety ceiling applied after anti-windup and does not feed back
+        # into the integrator, keeping the integrator state accurate.
+        if self.out_min is not None or self.out_max is not None:
+            # Recompute what the previous raw output would have been
+            # clamped to — this is the saturation error term.
+            prev_raw = self._output_raw
+            prev_sat = prev_raw
+            if self.out_max is not None and prev_sat > self.out_max:
+                prev_sat = self.out_max
+            elif self.out_min is not None and prev_sat < self.out_min:
+                prev_sat = self.out_min
+            sat_error = prev_sat - prev_raw  # zero when unsaturated
+        else:
+            sat_error = 0.0
+
+        Kaw = self._aw_gain()
+        self.integral += (error + Kaw * sat_error) * dt
 
         if self.integral_limit is not None:
             self.integral = _clamp(
                 self.integral, -self.integral_limit, self.integral_limit
             )
 
+        # ── PID output ───────────────────────────────────────────────────
         output_raw = (
             self.kp * error +
             self.ki * self.integral +
             self.kd * self.derivative
         )
 
-        # ── Fix 5: back-calculation anti-windup against hardware limits ──
-        output = output_raw
+        # Store raw output for next step's back-calculation.
+        self._output_raw = output_raw
 
+        # ── Hardware saturation clamp ────────────────────────────────────
+        output = output_raw
         if self.out_min is not None and output < self.out_min:
             output = self.out_min
-            if self.ki != 0.0:
-                self.integral -= (output_raw - output) / self.ki
-
         elif self.out_max is not None and output > self.out_max:
             output = self.out_max
-            if self.ki != 0.0:
-                self.integral -= (output_raw - output) / self.ki
 
-        # ── Fix 9: max_output cap ───────────────────────────────────────
-        # Clamp the magnitude to max_output fraction of the saturation
-        # range.  This is a soft safety ceiling — the anti-windup above
-        # already corrected the integral against the real hardware limits,
-        # so this extra cap doesn't distort the integrator.
+        # ── Soft max_output cap ──────────────────────────────────────────
         if self.out_max is not None:
             cap_hi = self.out_max * self.max_output
             if output > cap_hi:
@@ -969,40 +912,11 @@ class PID:
             if output < cap_lo:
                 output = cap_lo
 
-        # ── online learning ─────────────────────────────────────────────
-        # Fix 2: skip learning on step 0
+        # ── online learning ──────────────────────────────────────────────
         if not self.frozen and self.step_count > 0:
-
-            # ── Fix 17: multi-objective reward ──────────────────────────
-            #
-            # The reward signal now balances three objectives:
-            #
-            #   1. error_improvement — positive when |error| decreased
-            #      since the last step, encouraging the MLP to reduce
-            #      tracking error.
-            #
-            #   2. control_penalty — a small cost proportional to the
-            #      control magnitude, discouraging unnecessarily large
-            #      actuator commands.
-            #
-            #   3. zeta_penalty — proportional to |target_ζ − current_ζ|,
-            #      encouraging the MLP to steer the gains toward the
-            #      desired damping regime.  Only active when a system
-            #      model is configured (system_type is not None).
-            #
-            # The overall loss_signal is:
-            #
-            #   loss = error_improvement
-            #        − control_penalty
-            #        − zeta_penalty × zeta_weight
-            #
             error_improvement = self.prev_abs_error - abs(error)
+            control_penalty   = abs(output) * 0.001
 
-            # Use the actual (post-clamp) output for control penalty so
-            # the learning signal is consistent with what goes into u_hist
-            control_penalty = abs(output) * 0.001
-
-            # Zeta penalty — only contributes when a plant model is set.
             if self.system_type is not None:
                 zeta_penalty = self.zeta_error
             else:
@@ -1014,7 +928,6 @@ class PID:
                 - zeta_penalty * self.zeta_weight
             )
 
-            # Fix 7: gradient floor prevents dead-zone when outputs ≈ 0
             dL = []
             for o in out:
                 g = -loss_signal * o
@@ -1025,7 +938,7 @@ class PID:
             self._mlp.backward(dL)
             self._mlp.step_sgd(lr=self.lr, clip=self.clip)
 
-        # ── update history ──────────────────────────────────────────────
+        # ── update history ───────────────────────────────────────────────
         self.e_hist = [error] + self.e_hist[:self._n_err - 1]
         self.u_hist = [output] + self.u_hist[:self._n_out - 1]
 
@@ -1035,7 +948,7 @@ class PID:
 
         return output
 
-    # ── reset ───────────────────────────────────────────────────────────
+    # ── reset ────────────────────────────────────────────────────────────
     def reset(self) -> None:
         """Reset PID state. MLP weights are preserved."""
         self.integral = 0.0
@@ -1052,37 +965,21 @@ class PID:
 
         self.step_count = 0
         self.prev_abs_error = 0.0
+        self._output_raw = 0.0
 
-        # Fix 17: reset live zeta state
         self.current_zeta = 0.0
         self.zeta_error = 0.0
 
-    # ── freeze learning ─────────────────────────────────────────────────
     def freeze(self) -> None:
         self.frozen = True
 
     def unfreeze(self) -> None:
         self.frozen = False
 
-    # ── Fix 17: zeta helper methods ─────────────────────────────────────
-
     def get_zeta(self) -> float:
-        """Return the most recently computed effective damping ratio.
-
-        This value is updated every step() call.  If no system model is
-        configured (system_type is None) this always returns 0.0.
-        """
         return self.current_zeta
 
     def set_target_zeta(self, target_zeta: float) -> None:
-        """Change the target damping ratio at runtime.
-
-        Parameters
-        ----------
-        target_zeta : float
-            Desired damping ratio.  Must be non-negative.
-            Values in [0.7, 1.0] are recommended for robotics.
-        """
         if target_zeta < 0.0:
             raise ValueError(
                 f"target_zeta must be non-negative, got {target_zeta}"
@@ -1097,26 +994,6 @@ class PID:
         motor_gain: float | None = None,
         time_constant: float | None = None,
     ) -> None:
-        """Change the plant model and/or parameters at runtime.
-
-        Pass system_type=None to disable zeta optimisation entirely.
-
-        Only parameters relevant to the chosen model need to be supplied;
-        others are ignored.  Omitted parameters retain their current value.
-
-        Parameters
-        ----------
-        system_type : str or None
-            "mass", "dc_motor", or None.
-        mass : float, optional
-            System mass for the "mass" model (kg).  Must be positive.
-        damping : float, optional
-            Viscous damping for the "mass" model (N·s/m).
-        motor_gain : float, optional
-            DC gain K for the "dc_motor" model.  Must be positive.
-        time_constant : float, optional
-            Time constant τ for the "dc_motor" model (s).  Must be positive.
-        """
         if system_type is not None and system_type not in _SYSTEM_MODELS:
             raise ValueError(
                 f"Unknown system_type '{system_type}'. "
@@ -1147,34 +1024,13 @@ class PID:
                 )
             self.time_constant = time_constant
 
-    # ── persistence ─────────────────────────────────────────────────────
+    # ── persistence ──────────────────────────────────────────────────────
     def save(self, path: str) -> None:
-        """
-        Save MLP weights, frozen flag, max_output, and system model
-        parameters to a binary file (magic NPD4).
-
-        Fix 17: NPD4 extends NPD3 with zeta-aware fields:
-          - system_type (encoded as uint8: 0=None, 1=mass, 2=dc_motor)
-          - target_zeta (float)
-          - zeta_weight (float)
-          - mass (float)
-          - damping (float)
-          - motor_gain (float)
-          - time_constant (float)
-        """
         flat = self._mlp._flatten()
 
-        # Encode system_type as uint8
         _sys_map = {None: 0, "mass": 1, "dc_motor": 2}
         sys_code = _sys_map.get(self.system_type, 0)
 
-        # Header: magic(4) + input_dim(4) + hidden(4) + out_dim(4)
-        #       + frozen(4) + max_output(4f)
-        #       + sys_code(1B) + pad(3B)
-        #       + target_zeta(4f) + zeta_weight(4f)
-        #       + mass(4f) + damping(4f) + motor_gain(4f) + time_constant(4f)
-        #
-        # Total header: 4(magic)+16(IIII)+4(f)+1(B)+3(pad)+24(ffffff) = 52 bytes
         header = struct.pack(
             "<4sIIIIf B3x ffffff",
             _PID_MAGIC,
@@ -1184,7 +1040,6 @@ class PID:
             int(self.frozen),
             self.max_output,
             sys_code,
-            # 3x padding bytes (implicit from struct)
             self.target_zeta,
             self.zeta_weight,
             self.mass,
@@ -1199,20 +1054,12 @@ class PID:
             f.write(header + body)
 
     def load(self, path: str) -> bool:
-        """
-        Load from an NPD4 file (current), NPD3, NPD2, or legacy NMLP file.
-
-        Architecture mismatches raise ValueError.
-        Returns True on success.
-        """
         with open(path, "rb") as f:
             data = f.read()
 
         magic = data[:4]
 
-        # ── NPD4 format (current — Fix 17) ──────────────────────────────
         if magic == _PID_MAGIC:
-            # Header is 52 bytes total (see save() layout)
             (
                 inp, hid, out, frozen_flag, max_output_val,
                 sys_code,
@@ -1229,7 +1076,6 @@ class PID:
             self.frozen = bool(frozen_flag)
             self.max_output = _clamp(max_output_val, 0.0, 1.0)
 
-            # Decode system_type
             _sys_decode = {0: None, 1: "mass", 2: "dc_motor"}
             self.system_type = _sys_decode.get(sys_code, None)
 
@@ -1242,7 +1088,6 @@ class PID:
 
             return True
 
-        # ── NPD3 format (backward compat — pre-zeta) ────────────────────
         if magic == _PID_MAGIC_V3:
             inp, hid, out, frozen_flag = struct.unpack("<IIII", data[4:20])
             max_output_val = struct.unpack("<f", data[20:24])[0]
@@ -1255,11 +1100,9 @@ class PID:
 
             self.frozen = bool(frozen_flag)
             self.max_output = _clamp(max_output_val, 0.0, 1.0)
-            # system_type / zeta params not in NPD3 — keep constructor defaults
 
             return True
 
-        # ── NPD2 format (backward compat) ───────────────────────────────
         if magic == _PID_MAGIC_V2:
             inp, hid, out, frozen_flag = struct.unpack("<IIII", data[4:20])
 
@@ -1270,11 +1113,9 @@ class PID:
             self._mlp._unflatten(flat)
 
             self.frozen = bool(frozen_flag)
-            # max_output not in NPD2 — keep constructor default
 
             return True
 
-        # ── legacy NMLP format ──────────────────────────────────────────
         if magic == b"NMLP":
             return self._mlp.load(path)
 
@@ -1295,9 +1136,7 @@ class PID:
                 f"profile that was used when saving."
             )
 
-    # ── info ────────────────────────────────────────────────────────────
     def gains(self) -> Gains:
-        """Return current gains as a named tuple."""
         return Gains(self.kp, self.ki, self.kd)
 
     def __repr__(self) -> str:
@@ -1311,7 +1150,6 @@ class PID:
             f"max_output={self.max_output:.0%}, ",
         ]
 
-        # Fix 17: include zeta info when a system model is configured
         if self.system_type is not None:
             parts.append(
                 f"ζ={self.current_zeta:.3f}→{self.target_zeta:.2f}, "
@@ -1330,16 +1168,6 @@ class PID:
 if __name__ == "__main__":
     import time
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  Turn PID
-    #  ========
-    #  For a differential-drive robot turning in place.
-    #  Fixed motor parameters: motor_gain=0.3, time_constant=0.15
-    #
-    #  These should be tuned to match your actual hardware:
-    #    motor_gain = (max_speed_at_100pct) / 100
-    #    time_constant ≈ time to reach 63% of final speed (seconds)
-    # ─────────────────────────────────────────────────────────────────────
     print("=" * 70)
     print("  Differential-Drive Robot: Turn PID")
     print("=" * 70)
@@ -1361,15 +1189,14 @@ if __name__ == "__main__":
         integral_limit=30.0,
         derivative_alpha=0.08,
         system_type="dc_motor",
-        motor_gain=0.3,      # tune to your motor: output_speed / input_pwm
-        time_constant=0.15,  # ~150ms typical for small geared DC motor
+        motor_gain=0.3,
+        time_constant=0.15,
         target_zeta=1.0,
         zeta_weight=0.5,
         max_output=0.75,
         default_dt=0.02,
     )
 
-    # Simulate a 90-degree turn
     target_angle = 90.0
     current_angle = 0.0
 
@@ -1377,9 +1204,6 @@ if __name__ == "__main__":
     for i in range(200):
         error = target_angle - current_angle
         control = turn_pid.step(error, setpoint=target_angle)
-
-        # Simple angular plant: angle += (control_speed * dt)
-        # Assume 75% output = 75 deg/sec max
         current_angle += (control * 0.75 / 75.0) * 0.02
 
         if i % 20 == 0:
@@ -1399,12 +1223,6 @@ if __name__ == "__main__":
 
     turn_pid.save("turn_weights.bin")
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  Drive PID
-    #  =========
-    #  For a differential-drive robot driving straight.
-    #  Same motor parameters as turn PID.
-    # ─────────────────────────────────────────────────────────────────────
     print()
     print("=" * 70)
     print("  Differential-Drive Robot: Drive PID")
@@ -1434,7 +1252,6 @@ if __name__ == "__main__":
         default_dt=0.02,
     )
 
-    # Simulate driving 100 units and stopping 30 cm away from wall
     target_distance = 100.0
     current_distance = 0.0
     stop_distance = 30.0
@@ -1443,19 +1260,16 @@ if __name__ == "__main__":
     for i in range(300):
         error = (target_distance - stop_distance) - current_distance
         control = drive_pid.step(error, setpoint=target_distance - stop_distance)
-
-        # Simple linear plant
         current_distance += (control * 0.75 / 75.0) * 0.02
 
         if i % 30 == 0:
             g = drive_pid.gains()
-            remaining = target_distance - current_distance
             print(
                 f"  Step {i:03d} | "
                 f"err={error:7.2f} | "
                 f"pos={current_distance:6.1f} | "
                 f"ctrl={control:6.1f}% | "
-                f"kp={g.kp:5.2f} ki={g.ki:5.3f} kd={g.kd:5.3f} | "
+                f"kp={g.kp:5.2f} ki={g.ki:.3f} kd={g.kd:.3f} | "
                 f"ζ={drive_pid.current_zeta:.3f}"
             )
 
@@ -1466,9 +1280,6 @@ if __name__ == "__main__":
 
     drive_pid.save("drive_weights.bin")
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  Load and verify persistence
-    # ─────────────────────────────────────────────────────────────────────
     print()
     print("=" * 70)
     print("  Verifying save/load persistence")
