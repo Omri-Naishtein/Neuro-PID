@@ -24,7 +24,7 @@ IN4_LINE = 51
 # ── PARAMETERS (from working version) ────────────────────────────────────────
 PWM_MAX        = 75       # motor cap (%)
 CRUISE_PWM     = 75       # max forward speed (allow fuller throttle at mid-range)
-MIN_PWM        = 32       # minimum motor speed — raised so robot doesn't crawl slowly
+MIN_PWM        = 25       # minimum forward motor speed (forward leg only) — lower so robot approaches walls gently
 
 # ── FORWARD OBSTACLE THRESHOLDS ──────────────────────────────────────────────
 STOP_DIST          = 0.20  # m — stop and enter WAIT when front is closer than this
@@ -37,7 +37,8 @@ SETTLE_SECONDS     = 1.5   # s — hold position after a turn before resuming fo
 TURN_ANGLE_DEG   = 90.0   # degrees for a standard 90° turn
 TURN_DONE_DEG    = 1.0    # degrees — completion tolerance (tighter = more exact)
 TURN_MIN_PWM     = 20     # % — motor floor; ramps down near target to prevent overshoot
-TURN_TIMEOUT     = 5.0    # s — give up and go forward if turn stalls
+TURN_MIN_TIME    = 5.0    # s — a turn must last at least this long before completing
+TURN_TIMEOUT     = 15.0   # s — give up and go forward if turn stalls (> TURN_MIN_TIME)
 DEADEND_TURN_DEG = 180  
 TURN_DEADBAND    = 0.10   # m — left/right must differ by more than this to turn;
                            #     smaller differences are treated as equal (noise guard)
@@ -190,38 +191,41 @@ class Robot(Node):
         # magnitudes differ by orders of magnitude.  Gains START at the values
         # below (the safe fallback) and the MLP only learns deviations.
 
-        # Heading — keep the robot driving straight.  mass≈6e-4 puts ζ=1 on the
-        # small heading gains; output is steering trim (±20%).
+        # Heading — keep the robot driving straight.  mass≈6e-4 puts ζ on the
+        # small heading gains; target ζ=0.9 for the forward leg. Output is
+        # steering trim (±20%).
         self.head_tuner = OnlineTuner(
             train=True,
             kp_range=(0.5, 8.0), ki_range=(0.0, 1.0), kd_range=(0.0, 0.5),
             init_gains=(HEAD_KP, HEAD_KI, HEAD_KD),
-            mass=0.0003, target_zeta=0.8, zeta_band=ZETA_BAND_HEAD,
+            mass=0.0003, target_zeta=0.9, zeta_band=ZETA_BAND_HEAD,
             feat_stop=0.0, feat_scale=90.0, feat_pwm=20.0,
             clamp_near_stop=False,
         )
         self.head_pid   = NeuralPID()
         self._last_corr = 0.0
 
-        # Distance → speed — the wall-approach loop.  mass=1.0, ζ=1 (critically
-        # damped: fastest approach with no overshoot into the wall).
+        # Distance → speed — the wall-approach loop (the forward leg).  mass=1.0,
+        # target ζ=0.9 (near-critically damped: fast approach, minimal overshoot
+        # into the wall).
         self.dist_tuner = OnlineTuner(
             train=True,
             feat_stop=STOP_DIST, feat_scale=MAX_RANGE, feat_pwm=float(PWM_MAX),
-            target_zeta=0.8, zeta_band=ZETA_BAND_DIST,
+            target_zeta=0.9, zeta_band=ZETA_BAND_DIST,
         )
         self.dist_pid    = NeuralPID()
         self._last_speed = float(MIN_PWM)
 
-        # Turn — rotate to a target heading. We intentionally target an
-        # underdamped controller (ζ≈0.7) to make turns faster; SETTLE absorbs
-        # the small overshoot. Allow faster online gain changes (higher
-        # `max_rate`) so the tuner can respond aggressively during a turn.
+        # Turn — rotate to a target heading (closed on the gyro heading only).
+        # Target a slightly underdamped controller (ζ=0.8) to make turns
+        # responsive; SETTLE absorbs the small overshoot. Allow faster online
+        # gain changes (higher `max_rate`) so the tuner can respond aggressively
+        # during a turn.
         self.turn_tuner = OnlineTuner(
             train=True,
             kp_range=(0.5, 8.0), ki_range=(0.0, 1.0), kd_range=(0.0, 2.0),
             init_gains=(TURN_KP, TURN_KI, TURN_KD),
-            mass=0.06, target_zeta=0.7, zeta_band=ZETA_BAND_TURN,
+            mass=0.06, target_zeta=0.8, zeta_band=ZETA_BAND_TURN,
             feat_stop=0.0, feat_scale=180.0, feat_pwm=float(PWM_MAX),
             clamp_near_stop=False,
         )
@@ -489,18 +493,25 @@ class Robot(Node):
         # ── TURN: NeuroPID-controlled rotation (90° or 180°) ─────────────
         if self.state == "TURN":
             error = wrap_angle(self.turn_target - heading)
+            elapsed = time.monotonic() - self.turn_started_at
 
-            # Completed: within 1° of target — enter settle pause
+            # Completed: within 1° of target — but a turn must last at least
+            # TURN_MIN_TIME. If we've reached the target early, hold still
+            # (motors off) and stay in TURN until the minimum time elapses,
+            # then enter the settle pause.
             if abs(error) < TURN_DONE_DEG:
+                if elapsed < TURN_MIN_TIME:
+                    self._stop_motors()
+                    return
                 self._stop_motors()
                 self.settle_until = time.monotonic() + SETTLE_SECONDS
                 self.state = "SETTLE"
-                print(f"Turn complete  (heading = {heading:.1f}°) — "
+                print(f"Turn complete  (heading = {heading:.1f}°, {elapsed:.1f} s) — "
                       f"settling for {SETTLE_SECONDS:.1f} s")
                 return
 
             # Safety timeout — enter settle anyway so robot stabilises
-            if time.monotonic() - self.turn_started_at > TURN_TIMEOUT:
+            if elapsed > TURN_TIMEOUT:
                 self._stop_motors()
                 self.settle_until = time.monotonic() + SETTLE_SECONDS
                 self.state = "SETTLE"
