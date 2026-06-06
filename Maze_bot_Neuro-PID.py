@@ -9,6 +9,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Vector3Stamped
 from Neuro import OnlineTuner
+import os
+import csv
 
 # ── GPIO CONFIG ───────────────────────────────────────────────────────────────
 CHIP     = "gpiochip0"
@@ -34,9 +36,9 @@ SETTLE_SECONDS     = 1.5   # s — hold position after a turn before resuming fo
 # ── TURN PARAMETERS ───────────────────────────────────────────────────────────
 TURN_ANGLE_DEG   = 90.0   # degrees for a standard 90° turn
 TURN_DONE_DEG    = 1.0    # degrees — completion tolerance (tighter = more exact)
-TURN_MIN_PWM     = 15     # % — motor floor; ramps down near target to prevent overshoot
-TURN_TIMEOUT     = 6.0    # s — give up and go forward if turn stalls
-DEADEND_TURN_DEG = 179.0  # degrees — U-turn (179 avoids wrap_angle ±180 ambiguity)
+TURN_MIN_PWM     = 20     # % — motor floor; ramps down near target to prevent overshoot
+TURN_TIMEOUT     = 5.0    # s — give up and go forward if turn stalls
+DEADEND_TURN_DEG = 180  
 TURN_DEADBAND    = 0.10   # m — left/right must differ by more than this to turn;
                            #     smaller differences are treated as equal (noise guard)
 
@@ -54,6 +56,21 @@ GYRO_DEADBAND  = 1.0
 HEAD_KP, HEAD_KI, HEAD_KD = 2.0, 0.15, 0.05    # heading baseline (MLP init)
 TURN_KP, TURN_KI, TURN_KD = 2.0, 0.3,  0.48    # turn baseline (MLP init)
 # Distance → speed gains come from the `Neuro.OnlineTuner` MLP (safe default ~= KP=80, KI=0.5, KD≈17.9)
+
+# ── TUNING: zeta-band and speed feedforward --------------------------------
+# Wider zeta bands make the tuner less likely to instantly revert to safe gains.
+ZETA_BAND_HEAD = 0.5
+ZETA_BAND_DIST = 0.6
+ZETA_BAND_TURN = 0.5
+
+# Feedforward blending for distance→PWM: weight in [0,1] (0 => only PID,
+# 1 => only feedforward). EXP < 1 boosts mid-range speeds.
+SPEED_FF_WEIGHT = 0.45
+SPEED_FF_EXP = 0.6
+
+# Runtime logging
+DEBUG_LOG = True
+LOG_FILENAME = "tuner_log.csv"
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -179,7 +196,7 @@ class Robot(Node):
             train=True,
             kp_range=(0.5, 8.0), ki_range=(0.0, 1.0), kd_range=(0.0, 0.5),
             init_gains=(HEAD_KP, HEAD_KI, HEAD_KD),
-            mass=0.0003, target_zeta=0.8,
+            mass=0.0003, target_zeta=0.8, zeta_band=ZETA_BAND_HEAD,
             feat_stop=0.0, feat_scale=90.0, feat_pwm=20.0,
             clamp_near_stop=False,
         )
@@ -191,23 +208,51 @@ class Robot(Node):
         self.dist_tuner = OnlineTuner(
             train=True,
             feat_stop=STOP_DIST, feat_scale=MAX_RANGE, feat_pwm=float(PWM_MAX),
-            target_zeta=0.8,
+            target_zeta=0.8, zeta_band=ZETA_BAND_DIST,
         )
         self.dist_pid    = NeuralPID()
         self._last_speed = float(MIN_PWM)
 
-        # Turn — rotate to a target heading, intentionally UNDERDAMPED (ζ≈0.7)
-        # for a fast turn; the SETTLE state absorbs the small overshoot.
+        # Turn — rotate to a target heading. We intentionally target an
+        # underdamped controller (ζ≈0.7) to make turns faster; SETTLE absorbs
+        # the small overshoot. Allow faster online gain changes (higher
+        # `max_rate`) so the tuner can respond aggressively during a turn.
         self.turn_tuner = OnlineTuner(
             train=True,
             kp_range=(0.5, 8.0), ki_range=(0.0, 1.0), kd_range=(0.0, 2.0),
             init_gains=(TURN_KP, TURN_KI, TURN_KD),
-            mass=0.06, target_zeta=0.8,
+            mass=0.06, target_zeta=0.7, zeta_band=ZETA_BAND_TURN,
             feat_stop=0.0, feat_scale=180.0, feat_pwm=float(PWM_MAX),
             clamp_near_stop=False,
         )
         self.turn_pid   = NeuralPID()
         self._last_turn = 0.0
+
+        # --- optional runtime logging of tuner outputs -----------------
+        if DEBUG_LOG:
+            try:
+                log_dir = os.path.join(os.getcwd(), "Yuval")
+                os.makedirs(log_dir, exist_ok=True)
+                log_path = os.path.join(log_dir, LOG_FILENAME)
+                first = not os.path.exists(log_path)
+                self._log_f = open(log_path, "a", newline="")
+                self._log_writer = csv.writer(self._log_f)
+                if first:
+                    self._log_writer.writerow([
+                        "ts", "state", "dist_front_m", "raw_speed", "ff", "speed",
+                        "kp_d","ki_d","kd_d","zeta_d",
+                        "kp_h","ki_h","kd_h","zeta_h",
+                        "kp_t","ki_t","kd_t","zeta_t",
+                        "correction","left","right",
+                    ])
+                    self._log_f.flush()
+            except Exception as e:
+                print("Warning: could not open tuner log:", e)
+                self._log_f = None
+                self._log_writer = None
+        else:
+            self._log_f = None
+            self._log_writer = None
 
         self._stop_motors()
         print("Calibrating gyro (5 s) — DO NOT MOVE ROBOT...")
@@ -257,6 +302,15 @@ class Robot(Node):
     #   Front  → minimum of valid rays  (safety-critical: stop on any close ray)
     #   Left/Right → mean of valid rays (decision-making: average is noise-robust)
     def scan_cb(self, msg):
+        # During a commanded rotation the lidar is not used by the turn loop
+        # (turns are closed on the gyro heading only). Processing every ray here
+        # blocks the single-threaded executor, delaying imu_cb and the turn
+        # completion check, which makes the robot overshoot the target angle.
+        # Skip the work while TURNING; SETTLE (robot stationary) refreshes the
+        # forward distance again before the next FORWARD leg.
+        if self.state == "TURN":
+            return
+
         front_min  = float("inf")
         left_sum,  left_n  = 0.0, 0
         right_sum, right_n = 0.0, 0
@@ -313,7 +367,13 @@ class Robot(Node):
                 self.dist_front, self._last_speed, time.monotonic()
             )
             dist_err = self.dist_front - STOP_DIST
-            speed = self.dist_pid.step(dist_err, kp_d, ki_d, kd_d)
+            raw_speed = self.dist_pid.step(dist_err, kp_d, ki_d, kd_d)
+
+            # Feedforward from distance to boost mid-range speed (smoothly).
+            norm = clamp((self.dist_front - STOP_DIST) / (MAX_RANGE - STOP_DIST), 0.0, 1.0)
+            ff = MIN_PWM + (CRUISE_PWM - MIN_PWM) * (norm ** SPEED_FF_EXP)
+
+            speed = SPEED_FF_WEIGHT * ff + (1.0 - SPEED_FF_WEIGHT) * raw_speed
             speed = clamp(speed, MIN_PWM, CRUISE_PWM)
             self._last_speed = speed
 
@@ -328,8 +388,35 @@ class Robot(Node):
             left  = clamp(speed + correction, 0, PWM_MAX)
             right = clamp(speed - correction, 0, PWM_MAX)
             print(f"[FWD] dist={self.dist_front*100:.0f}cm  "
-                  f"kp={kp_d:.1f} ki={ki_d:.2f} kd={kd_d:.1f}  speed={speed:.0f}%  "
+                  f"kp={kp_d:.1f} ki={ki_d:.2f} kd={kd_d:.1f}  "
+                  f"speed={speed:.0f}% (pid={raw_speed:.0f} ff={ff:.0f})  "
                   f"steering={correction:+.0f}  L={left:.0f}%  R={right:.0f}%")
+
+            if DEBUG_LOG and getattr(self, "_log_writer", None):
+                try:
+                    zeta_d = kd_d / (2.0 * math.sqrt(max(kp_d + 0.1 * ki_d, 1e-9)))
+                    zeta_h = kd_h / (2.0 * math.sqrt(max(kp_h + 0.1 * ki_h, 1e-9)))
+                    if hasattr(self, "turn_tuner") and getattr(self.turn_tuner, "gains", None) is not None:
+                        tg = self.turn_tuner.gains
+                        kp_t = float(tg[0]); ki_t = float(tg[1]); kd_t = float(tg[2])
+                        zeta_t = kd_t / (2.0 * math.sqrt(max(kp_t + 0.1 * ki_t, 1e-9)))
+                    else:
+                        kp_t = ki_t = kd_t = zeta_t = 0.0
+                    ts = time.time()
+                    self._log_writer.writerow([
+                        ts, self.state, round(self.dist_front, 3), round(raw_speed, 3), round(ff, 3), round(speed, 3),
+                        round(kp_d, 3), round(ki_d, 3), round(kd_d, 3), round(zeta_d, 3),
+                        round(kp_h, 3), round(ki_h, 3), round(kd_h, 3), round(zeta_h, 3),
+                        round(kp_t, 3), round(ki_t, 3), round(kd_t, 3), round(zeta_t, 3),
+                        round(correction, 3), round(left, 3), round(right, 3),
+                    ])
+                    try:
+                        self._log_f.flush()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
             self._drive_forward(left, right)
             return
 
@@ -430,6 +517,8 @@ class Robot(Node):
             )
             cmd = self.turn_pid.step(error, kp_t, ki_t, kd_t)
             spd = clamp(abs(cmd), turn_min, PWM_MAX)
+            # enforce absolute minimum turn speed
+            spd = max(spd, TURN_MIN_PWM)
             self._last_turn = spd
             print(f"[TURN] err={error:+.1f}°  kp={kp_t:.1f} ki={ki_t:.2f} kd={kd_t:.1f} "
                   f"cmd={cmd:+.1f}%  spd={spd:.0f}%")
@@ -483,6 +572,11 @@ class Robot(Node):
         self._stop_motors()
         self.left_pwm.stop()
         self.right_pwm.stop()
+        if hasattr(self, "_log_f") and self._log_f:
+            try:
+                self._log_f.close()
+            except Exception:
+                pass
 
 
 
