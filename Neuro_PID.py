@@ -3,22 +3,22 @@ pid_gain_mlp.py
 ----------------
 Adaptive PID auto-tuner for the wall-following robot.
 
-A small MLP (5 -> 16 tanh -> 3 scaled-sigmoid) maps the current driving
+A small MLP (5 -> 16 ReLU -> 3 scaled-sigmoid) maps the current driving
 situation to PID gains (Kp, Ki, Kd). The gains are shaped so that the
 estimated damping ratio
 
         zeta_est = Kd / (2 * sqrt(Kp + 0.1*Ki))
 
-is driven toward 1 (critical damping = fastest approach with no overshoot).
+is driven toward 0.85 (slightly underdamped: fast response, minimal overshoot).
 
 Design notes
 ------------
 * Output is a SCALED SIGMOID -> gains are HARD-BOUNDED to safe ranges.
-* Output layer is initialized to a CONSTANT, critically-damped controller
-  (Kp=80, Ki=0.5, Kd=17.9 -> zeta=1) so the robot is safe at step zero and
-  only learns DEVIATIONS from that baseline.
-* zeta=1 alone is underdetermined, so the loss also includes a tracking term
-  (so the input actually matters), an effort penalty, and a smoothness term.
+* Output layer is initialized to a CONSTANT baseline controller
+  (Kp=25, Ki=5, Kd=10 -> zeta≈0.99) so the robot is safe at step zero and
+  only learns DEVIATIONS from that baseline via backprop.
+* zeta target alone is underdetermined, so the loss also includes a tracking
+  term (so the input actually matters), an effort penalty, and a smoothness term.
 * Runtime is inference-only by default. Online training is optional and
   guarded by rate-limiting + a hard safety fallback.
 
@@ -36,9 +36,10 @@ KP_LO, KP_HI = 20.0, 120.0
 KI_LO, KI_HI = 0.0, 10.0
 KD_LO, KD_HI = 2.0, 20.0
 
-# Safe critically-damped starting point (used for init AND as the fallback)
-KP0, KI0 = 80.0, 0.5
-KD0 = 2.0 * math.sqrt(KP0 + 0.1 * KI0)          # ~= 17.89 -> zeta_est == 1.0
+# Baseline gains (used for init AND as the fallback); zeta_est ≈ 0.99 at start,
+# backprop drives it toward the 0.85 target during online learning.
+KP0, KI0 = 25.0, 5.0
+KD0 = 10.0
 SAFE_GAINS = torch.tensor([KP0, KI0, KD0], dtype=torch.float32)
 
 
@@ -51,7 +52,7 @@ def _logit(p: float) -> float:
 # The network
 # ---------------------------------------------------------------------------
 class GainMLP(nn.Module):
-    """5 inputs -> 16 tanh -> 3 scaled-sigmoid outputs (Kp, Ki, Kd)."""
+    """5 inputs -> 16 ReLU -> 3 scaled-sigmoid outputs (Kp, Ki, Kd)."""
 
     def __init__(self, n_in: int = 5, n_hidden: int = 16,
                  kp_range=(KP_LO, KP_HI),
@@ -71,13 +72,13 @@ class GainMLP(nn.Module):
         self.fc1 = nn.Linear(n_in, n_hidden)
         self.fc2 = nn.Linear(n_hidden, 3)
 
-        # Hidden: Xavier (correct for tanh), bias 0.
-        nn.init.xavier_uniform_(self.fc1.weight)
+        # Hidden: Kaiming (correct for ReLU), bias 0.
+        nn.init.kaiming_uniform_(self.fc1.weight, nonlinearity='relu')
         nn.init.zeros_(self.fc1.bias)
 
         # Output weights 0 -> network starts as a CONSTANT controller and
         # learns deviations from it. Output biases set so that constant is
-        # the supplied safe (kp0, ki0, kd0) point.
+        # the supplied baseline (kp0, ki0, kd0) point.
         nn.init.zeros_(self.fc2.weight)
         with torch.no_grad():
             self.fc2.bias[0] = _logit((kp0 - kp_lo) / (kp_hi - kp_lo))
@@ -89,7 +90,7 @@ class GainMLP(nn.Module):
         self.register_buffer("safe", torch.tensor([kp0, ki0, kd0]))
 
     def forward(self, x):
-        h = torch.tanh(self.fc1(x))
+        h = torch.relu(self.fc1(x))
         z = torch.sigmoid(self.fc2(h))
         return self.lo + (self.hi - self.lo) * z      # (..., 3) = Kp, Ki, Kd
 
@@ -116,7 +117,7 @@ def zeta_est(gains, mass=1.0):
     return kd / (2.0 * torch.sqrt(kp + 0.1 * ki + 1e-6))
 
 
-def gain_loss(gains, track_err=None, prev_gains=None, mass=1.0, target_zeta=1.0,
+def gain_loss(gains, track_err=None, prev_gains=None, mass=1.0, target_zeta=0.85,
               w_zeta=1.0, w_track=0.1, w_effort=1e-4, w_smooth=1e-3):
     z = zeta_est(gains, mass)
     loss = w_zeta * (z - target_zeta) ** 2               # drive ζ → target
@@ -177,7 +178,7 @@ class OnlineTuner:
                  train=False, weights_path=None,
                  kp_range=(KP_LO, KP_HI), ki_range=(KI_LO, KI_HI),
                  kd_range=(KD_LO, KD_HI), init_gains=None,
-                 mass=1.0, target_zeta=0.8, zeta_band=0.4,
+                 mass=1.0, target_zeta=0.85, zeta_band=0.4,
                  feat_stop=0.20, feat_scale=2.0, feat_pwm=75.0,
                  clamp_near_stop=True):
         self.net = GainMLP(kp_range=kp_range, ki_range=ki_range,
@@ -276,7 +277,7 @@ if __name__ == "__main__":
     net = GainMLP()
     g0 = net(torch.zeros(5))
     print("Init gains:", [round(float(v), 2) for v in g0],
-          " zeta:", round(float(zeta_est(g0)), 3))   # expect zeta ~= 1.0
+          " zeta:", round(float(zeta_est(g0)), 3))   # expect zeta ~= 0.99 (Kp=25,Ki=5,Kd=10)
     pretrain(net)
     g1 = net(torch.tensor([0.8, 0.0, 0.0, 0.5, 0.1]))   # far from wall
     g2 = net(torch.tensor([0.05, 0.0, 0.0, 0.3, 0.7]))  # close + ringing

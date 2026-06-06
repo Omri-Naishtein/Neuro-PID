@@ -8,7 +8,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Vector3Stamped
-from Neuro import OnlineTuner
+from Neuro_PID import OnlineTuner
 
 # ── GPIO CONFIG ───────────────────────────────────────────────────────────────
 CHIP     = "gpiochip0"
@@ -20,9 +20,9 @@ IN3_LINE = 52
 IN4_LINE = 51
 
 # ── PARAMETERS (from working version) ────────────────────────────────────────
-PWM_MAX        = 75       # motor cap (%)
-CRUISE_PWM     = 75       # max forward speed (allow fuller throttle at mid-range)
-MIN_PWM        = 32       # minimum motor speed — raised so robot doesn't crawl slowly
+PWM_MAX        = 80       # motor cap (%)
+CRUISE_PWM     = 80       # max forward speed
+MIN_PWM        = 30       # minimum motor speed (30% floor)
 
 # ── FORWARD OBSTACLE THRESHOLDS ──────────────────────────────────────────────
 STOP_DIST          = 0.20  # m — stop and enter WAIT when front is closer than this
@@ -34,7 +34,7 @@ SETTLE_SECONDS     = 1.5   # s — hold position after a turn before resuming fo
 # ── TURN PARAMETERS ───────────────────────────────────────────────────────────
 TURN_ANGLE_DEG   = 90.0   # degrees for a standard 90° turn
 TURN_DONE_DEG    = 1.0    # degrees — completion tolerance (tighter = more exact)
-TURN_MIN_PWM     = 15     # % — motor floor; ramps down near target to prevent overshoot
+TURN_MIN_PWM     = 30     # % — hard motor floor during turns (no ramp-down)
 TURN_TIMEOUT     = 6.0    # s — give up and go forward if turn stalls
 DEADEND_TURN_DEG = 179.0  # degrees — U-turn (179 avoids wrap_angle ±180 ambiguity)
 TURN_DEADBAND    = 0.10   # m — left/right must differ by more than this to turn;
@@ -51,9 +51,9 @@ MAX_RANGE      = 2.0      # m — discard returns beyond this distance
 GYRO_DEADBAND  = 1.0
 
 # ── SAFE GAINS (used as MLP init / fallback) ─────────────────────────────────
-HEAD_KP, HEAD_KI, HEAD_KD = 2.0, 0.15, 0.05    # heading baseline (MLP init)
-TURN_KP, TURN_KI, TURN_KD = 2.0, 0.3,  0.48    # turn baseline (MLP init)
-# Distance → speed gains come from the `Neuro.OnlineTuner` MLP (safe default ~= KP=80, KI=0.5, KD≈17.9)
+HEAD_KP, HEAD_KI, HEAD_KD = 2.0, 0.15, 2.41    # heading baseline → zeta≈0.85 at init
+TURN_KP, TURN_KI, TURN_KD = 2.0, 0.3,  2.42    # turn baseline → zeta≈0.85 at init
+# Distance → speed gains come from Neuro_PID.OnlineTuner MLP (baseline Kp=25, Ki=5, Kd=10 → zeta≈0.99)
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -173,36 +173,36 @@ class Robot(Node):
         # magnitudes differ by orders of magnitude.  Gains START at the values
         # below (the safe fallback) and the MLP only learns deviations.
 
-        # Heading — keep the robot driving straight.  mass≈6e-4 puts ζ=1 on the
-        # small heading gains; output is steering trim (±20%).
+        # Heading — keep the robot driving straight; output is steering trim (±20%).
+        # Kd range widened to (0, 5) so zeta=0.85 is reachable with small Kp~2.
         self.head_tuner = OnlineTuner(
             train=True,
-            kp_range=(0.5, 8.0), ki_range=(0.0, 1.0), kd_range=(0.0, 0.5),
+            kp_range=(0.5, 8.0), ki_range=(0.0, 1.0), kd_range=(0.0, 5.0),
             init_gains=(HEAD_KP, HEAD_KI, HEAD_KD),
-            mass=0.0003, target_zeta=0.8,
+            mass=0.0003, target_zeta=0.85,
             feat_stop=0.0, feat_scale=90.0, feat_pwm=20.0,
             clamp_near_stop=False,
         )
         self.head_pid   = NeuralPID()
         self._last_corr = 0.0
 
-        # Distance → speed — the wall-approach loop.  mass=1.0, ζ=1 (critically
-        # damped: fastest approach with no overshoot into the wall).
+        # Distance → speed — wall-approach loop. Baseline Kp=25/Ki=5/Kd=10;
+        # backprop drives zeta from ~0.99 toward 0.85 during operation.
         self.dist_tuner = OnlineTuner(
             train=True,
             feat_stop=STOP_DIST, feat_scale=MAX_RANGE, feat_pwm=float(PWM_MAX),
-            target_zeta=0.8,
+            target_zeta=0.85,
         )
         self.dist_pid    = NeuralPID()
         self._last_speed = float(MIN_PWM)
 
-        # Turn — rotate to a target heading, intentionally UNDERDAMPED (ζ≈0.7)
-        # for a fast turn; the SETTLE state absorbs the small overshoot.
+        # Turn — rotate to a target heading. Kd range widened to (0, 5) so
+        # zeta=0.85 is reachable; SETTLE state absorbs any residual overshoot.
         self.turn_tuner = OnlineTuner(
             train=True,
-            kp_range=(0.5, 8.0), ki_range=(0.0, 1.0), kd_range=(0.0, 2.0),
+            kp_range=(0.5, 8.0), ki_range=(0.0, 1.0), kd_range=(0.0, 5.0),
             init_gains=(TURN_KP, TURN_KI, TURN_KD),
-            mass=0.06, target_zeta=0.8,
+            mass=0.06, target_zeta=0.85,
             feat_stop=0.0, feat_scale=180.0, feat_pwm=float(PWM_MAX),
             clamp_near_stop=False,
         )
@@ -421,10 +421,7 @@ class Robot(Node):
                       f"settling for {SETTLE_SECONDS:.1f} s")
                 return
 
-            # Scale the motor floor down as we close in on the target.
-            # At ≥20° away: floor = TURN_MIN_PWM.  At <20°: floor ramps toward 10%
-            # so the robot decelerates instead of crashing through the setpoint.
-            turn_min = clamp(int(TURN_MIN_PWM * abs(error) / 20.0), 10, TURN_MIN_PWM)
+            turn_min = TURN_MIN_PWM  # hard 30% floor throughout the turn
             kp_t, ki_t, kd_t = self.turn_tuner.maybe_update(
                 error, self._last_turn, time.monotonic()
             )
