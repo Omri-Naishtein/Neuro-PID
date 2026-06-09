@@ -22,7 +22,7 @@ IN4_LINE = 51
 
 # ── PARAMETERS (from working version) ────────────────────────────────────────
 PWM_MAX        = 75       # motor cap (%)
-MIN_PWM        = 35       # minimum motor speed — lower so it can creep near wall
+MIN_PWM        = 35       # % — minimum forward speed (floor on the forward leg)
 
 # ── FORWARD OBSTACLE THRESHOLDS ──────────────────────────────────────────────
 STOP_DIST          = 0.30  # m — stop and enter WAIT when front is closer than this
@@ -408,7 +408,7 @@ class Robot(Node):
             turn_min = clamp(int(TURN_MIN_PWM * abs(error) / 20.0), 10, TURN_MIN_PWM)
             cmd = self.pid_turn.step(error, setpoint=self.turn_target)
             spd = clamp(abs(cmd), turn_min, PWM_MAX)
-            spd = max(spd, TURN_MIN_PWM)   # enforce absolute minimum turn speed (37%)
+            spd = max(spd, TURN_MIN_PWM)   # enforce absolute minimum turn speed
             print(f"[TURN] err={error:+.1f}°  cmd={cmd:+.1f}%  spd={spd:.0f}%")
             if cmd > 0:
                 self._turn_left(spd)
