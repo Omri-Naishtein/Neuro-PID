@@ -53,21 +53,8 @@ def _logit(p: float) -> float:
 class GainMLP(nn.Module):
     """5 inputs -> 16 tanh -> 3 scaled-sigmoid outputs (Kp, Ki, Kd)."""
 
-    def __init__(self, n_in: int = 5, n_hidden: int = 16,
-                 kp_range=(KP_LO, KP_HI),
-                 ki_range=(KI_LO, KI_HI),
-                 kd_range=(KD_LO, KD_HI),
-                 init_gains=None):
+    def __init__(self, n_in: int = 5, n_hidden: int = 16):
         super().__init__()
-        kp_lo, kp_hi = kp_range
-        ki_lo, ki_hi = ki_range
-        kd_lo, kd_hi = kd_range
-
-        # Default safe init = the critically-damped distance controller.
-        if init_gains is None:
-            init_gains = (KP0, KI0, KD0)
-        kp0, ki0, kd0 = init_gains
-
         self.fc1 = nn.Linear(n_in, n_hidden)
         self.fc2 = nn.Linear(n_hidden, 3)
 
@@ -77,16 +64,15 @@ class GainMLP(nn.Module):
 
         # Output weights 0 -> network starts as a CONSTANT controller and
         # learns deviations from it. Output biases set so that constant is
-        # the supplied safe (kp0, ki0, kd0) point.
+        # the safe, critically-damped (Kp0, Ki0, Kd0) point.
         nn.init.zeros_(self.fc2.weight)
         with torch.no_grad():
-            self.fc2.bias[0] = _logit((kp0 - kp_lo) / (kp_hi - kp_lo))
-            self.fc2.bias[1] = _logit((ki0 - ki_lo) / (ki_hi - ki_lo))
-            self.fc2.bias[2] = _logit((kd0 - kd_lo) / (kd_hi - kd_lo))
+            self.fc2.bias[0] = _logit((KP0 - KP_LO) / (KP_HI - KP_LO))
+            self.fc2.bias[1] = _logit((KI0 - KI_LO) / (KI_HI - KI_LO))
+            self.fc2.bias[2] = _logit((KD0 - KD_LO) / (KD_HI - KD_LO))
 
-        self.register_buffer("lo", torch.tensor([kp_lo, ki_lo, kd_lo]))
-        self.register_buffer("hi", torch.tensor([kp_hi, ki_hi, kd_hi]))
-        self.register_buffer("safe", torch.tensor([kp0, ki0, kd0]))
+        self.register_buffer("lo", torch.tensor([KP_LO, KI_LO, KD_LO]))
+        self.register_buffer("hi", torch.tensor([KP_HI, KI_HI, KD_HI]))
 
     def forward(self, x):
         h = torch.tanh(self.fc1(x))
@@ -107,19 +93,15 @@ class GainMLP(nn.Module):
 # ---------------------------------------------------------------------------
 # zeta and loss
 # ---------------------------------------------------------------------------
-def zeta_est(gains, mass=1.0):
-    # Damping estimate computed only from the PID gains (Kp, Ki, Kd):
-    #   ζ = Kd / (2 * sqrt(Kp + 0.1 * Ki)).
-    # `mass` is accepted for API compatibility but ignored — the zeta
-    # calculation now depends solely on the returned gains.
+def zeta_est(gains):
     kp, ki, kd = gains[..., 0], gains[..., 1], gains[..., 2]
     return kd / (2.0 * torch.sqrt(kp + 0.1 * ki + 1e-6))
 
 
-def gain_loss(gains, track_err=None, prev_gains=None, mass=1.0, target_zeta=1.0,
+def gain_loss(gains, track_err=None, prev_gains=None,
               w_zeta=1.0, w_track=0.1, w_effort=1e-4, w_smooth=1e-3):
-    z = zeta_est(gains, mass)
-    loss = w_zeta * (z - target_zeta) ** 2               # drive ζ → target
+    z = zeta_est(gains)
+    loss = w_zeta * (z - 1.0) ** 2                       # critical damping
     if track_err is not None:                            # makes input matter
         loss = loss + w_track * track_err ** 2
     loss = loss + w_effort * gains[..., 0] ** 2          # discourage huge Kp
@@ -174,31 +156,19 @@ class FeatureBuilder:
 # ---------------------------------------------------------------------------
 class OnlineTuner:
     def __init__(self, lr=1e-3, update_hz=8.0, max_rate=20.0,
-                 train=False, weights_path=None,
-                 kp_range=(KP_LO, KP_HI), ki_range=(KI_LO, KI_HI),
-                 kd_range=(KD_LO, KD_HI), init_gains=None,
-                 mass=1.0, target_zeta=0.8, zeta_band=0.4,
-                 feat_stop=0.20, feat_scale=2.0, feat_pwm=75.0,
-                 clamp_near_stop=True):
-        self.net = GainMLP(kp_range=kp_range, ki_range=ki_range,
-                           kd_range=kd_range, init_gains=init_gains)
+                 train=False, weights_path=None):
+        self.net = GainMLP()
         if weights_path:
             self.net.load_state_dict(torch.load(weights_path, map_location="cpu"))
         self.net.eval()
-        self.feat = FeatureBuilder(stop_dist=feat_stop, max_range=feat_scale,
-                                   pwm_max=feat_pwm)
+        self.feat = FeatureBuilder()
         self.opt = torch.optim.Adam(self.net.parameters(), lr=lr)
         self.train_online = train
         self.period = 1.0 / update_hz
         self.max_rate = max_rate                # max gain change per second
         self.last_update = 0.0
-        self.mass = mass                        # ζ-model scale for this loop
-        self.target_zeta = target_zeta          # damping target this loop aims for
-        self.zeta_band = zeta_band              # ± band before safety fallback
-        self.clamp_near_stop = clamp_near_stop  # distance loop: snap to safe near wall
-        self.safe = self.net.safe.clone()       # per-loop safe fallback gains
-        self.gains = self.safe.clone()
-        self.prev_out = self.safe.clone()
+        self.gains = SAFE_GAINS.clone()
+        self.prev_out = SAFE_GAINS.clone()
 
     def maybe_update(self, dist_front, speed, t):
         """Call every loop; returns current (kp, ki, kd) as floats."""
@@ -214,8 +184,7 @@ class OnlineTuner:
             out = self.net(x)
             loss = gain_loss(out,
                              track_err=(dist_front - self.feat.stop),
-                             prev_gains=self.prev_out.detach(),
-                             mass=self.mass, target_zeta=self.target_zeta)
+                             prev_gains=self.prev_out.detach())
             self.opt.zero_grad(); loss.backward(); self.opt.step()
             self.net.eval()
             with torch.no_grad():
@@ -230,15 +199,10 @@ class OnlineTuner:
                             torch.minimum(self.prev_out + step, out))
         self.prev_out = out.clone()
 
-        # safety fallback: revert to this loop's safe gains if ζ leaves the
-        # band around its target, or (distance loop only) if we are at/inside
-        # the stop distance.
-        z = float(zeta_est(out, self.mass))
-        lo_z = self.target_zeta - self.zeta_band
-        hi_z = self.target_zeta + self.zeta_band
-        near_limit = self.clamp_near_stop and (dist_front <= self.feat.stop)
-        if near_limit or not (lo_z <= z <= hi_z):
-            out = self.safe.clone()
+        # safety fallback
+        z = float(zeta_est(out))
+        if dist_front <= self.feat.stop or not (0.6 <= z <= 1.4):
+            out = SAFE_GAINS.clone()
             self.prev_out = out.clone()
 
         self.gains = out
