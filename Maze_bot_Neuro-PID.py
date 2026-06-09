@@ -8,9 +8,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Vector3Stamped
-from Neuro import OnlineTuner
-import os
-import csv
+from neuropid import PID as NeuroPID
+from Neuro1_Y import OnlineTuner, FeatureBuilder
 
 # ── GPIO CONFIG ───────────────────────────────────────────────────────────────
 CHIP     = "gpiochip0"
@@ -23,24 +22,21 @@ IN4_LINE = 51
 
 # ── PARAMETERS (from working version) ────────────────────────────────────────
 PWM_MAX        = 75       # motor cap (%)
-CRUISE_PWM     = 75       # max forward speed (allow fuller throttle at mid-range)
-MIN_PWM        = 25       # minimum forward motor speed (forward leg only) — lower so robot approaches walls gently
+MIN_PWM        = 35       # minimum motor speed — lower so it can creep near wall
 
 # ── FORWARD OBSTACLE THRESHOLDS ──────────────────────────────────────────────
-STOP_DIST          = 0.20  # m — stop and enter WAIT when front is closer than this
+STOP_DIST          = 0.30  # m — stop and enter WAIT when front is closer than this
 DEADEND_SIDE_DIST  = 0.20  # m — both sides must be below this to trigger a U-turn
 CONFIRM_SCANS      = 2     # consecutive scans below STOP_DIST before stopping
-WAIT_SECONDS       = 2.0   # s — pause after stopping before entering DECIDE
-SETTLE_SECONDS     = 1.5   # s — hold position after a turn before resuming forward
+WAIT_SECONDS       = 0.25   # s — pause after stopping before entering DECIDE
+SETTLE_SECONDS     = 0.25   # s — hold position after a turn before resuming forward
 
 # ── TURN PARAMETERS ───────────────────────────────────────────────────────────
 TURN_ANGLE_DEG   = 90.0   # degrees for a standard 90° turn
 TURN_DONE_DEG    = 1.0    # degrees — completion tolerance (tighter = more exact)
-TURN_MIN_PWM     = 20     # % — motor floor; ramps down near target to prevent overshoot
-TURN_MIN_TIME    = 5.0    # s — a turn must last at least this long before completing
-TURN_TIMEOUT     = 15.0   # s — give up and go forward if turn stalls (> TURN_MIN_TIME)
-DEADEND_TURN_DEG = 180  
-TURN_DEADBAND    = 0.10   # m — left/right must differ by more than this to turn;
+TURN_MIN_PWM     = 35     # % — absolute minimum turn speed (motors never turn slower)
+DEADEND_TURN_DEG = 180.0  # degrees — U-turn (179 avoids wrap_angle ±180 ambiguity)
+TURN_DEADBAND    = 0.05   # m — left/right must differ by more than this to turn;
                            #     smaller differences are treated as equal (noise guard)
 
 IMU_CALIB_TIME = 5.0      # s — gyro bias calibration window
@@ -53,25 +49,10 @@ MAX_RANGE      = 2.0      # m — discard returns beyond this distance
 # deadband for gyro rate (deg/s)
 GYRO_DEADBAND  = 1.0
 
-# ── SAFE GAINS (used as MLP init / fallback) ─────────────────────────────────
-HEAD_KP, HEAD_KI, HEAD_KD = 2.0, 0.15, 0.05    # heading baseline (MLP init)
-TURN_KP, TURN_KI, TURN_KD = 2.0, 0.3,  0.48    # turn baseline (MLP init)
-# Distance → speed gains come from the `Neuro.OnlineTuner` MLP (safe default ~= KP=80, KI=0.5, KD≈17.9)
-
-# ── TUNING: zeta-band and speed feedforward --------------------------------
-# Wider zeta bands make the tuner less likely to instantly revert to safe gains.
-ZETA_BAND_HEAD = 0.5
-ZETA_BAND_DIST = 0.6
-ZETA_BAND_TURN = 0.5
-
-# Feedforward blending for distance→PWM: weight in [0,1] (0 => only PID,
-# 1 => only feedforward). EXP < 1 boosts mid-range speeds.
-SPEED_FF_WEIGHT = 0.45
-SPEED_FF_EXP = 0.6
-
-# Runtime logging
-DEBUG_LOG = True
-LOG_FILENAME = "tuner_log.csv"
+# ── PID GAINS ────────────────────────────────────────────────────────────────
+HEAD_KP, HEAD_KI, HEAD_KD = 2.0, 0.15, 0.05    # heading correction (NeuroPID)
+TURN_KP, TURN_KI, TURN_KD = 2.0, 0.3,  0.48    # rotation (NeuroPID) — ζ ≈ 0.7
+# Distance → speed gains come from Neuro1.OnlineTuner (starts at KP=80, KI=0.5, KD≈17.9)
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -90,11 +71,10 @@ def wrap_rad(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
-class NeuralPID:
+class _DistPID:
     """Stateful PID integrator whose gains are supplied externally each step.
-    Used with Neuro.OnlineTuner: the tuner (an MLP) provides (kp, ki, kd) and
-    this class only maintains the integral / derivative state and applies them.
-    There are NO hand-tuned constant-gain PIDs anywhere — every loop is neural."""
+    Used with Neuro1.OnlineTuner: the tuner provides (kp, ki, kd); this class
+    maintains the integral and derivative state across calls."""
 
     def __init__(self):
         self.reset()
@@ -183,80 +163,47 @@ class Robot(Node):
         self.obstacle_count  = 0
         self.start_time      = time.monotonic()
 
-        # ── Neural controllers (Neuro.OnlineTuner) ───────────────────────
-        # Every loop is a PID whose (Kp, Ki, Kd) are produced online by a small
-        # MLP — there are NO hand-tuned constant-gain PIDs.  Each tuner drives
-        # its damping estimate  ζ = Kd / (2·√(mass·Kp))  toward a target; the
-        # `mass` scale lets the same network design serve loops whose gain
-        # magnitudes differ by orders of magnitude.  Gains START at the values
-        # below (the safe fallback) and the MLP only learns deviations.
+        # NeuroPID controllers — all configured with system_type so the MLP's
+        # zeta reward anchors the adapted gains to critical damping (ζ=1).
+        # model parameters are back-calculated from base gains so ζ starts at 1;
+        # the MLP is then penalised whenever it drifts away.
+        # Activation: neuropid uses ReLU (clip to [0, 1e6]) — fastest convergence
+        # for online gain tuning; sigmoid would cause vanishing gradients here.
 
-        # Heading — keep the robot driving straight.  mass≈6e-4 puts ζ on the
-        # small heading gains; target ζ=0.9 for the forward leg. Output is
-        # steering trim (±20%).
-        self.head_tuner = OnlineTuner(
-            train=True,
-            kp_range=(0.5, 8.0), ki_range=(0.0, 1.0), kd_range=(0.0, 0.5),
-            init_gains=(HEAD_KP, HEAD_KI, HEAD_KD),
-            mass=0.0003, target_zeta=0.9, zeta_band=ZETA_BAND_HEAD,
-            feat_stop=0.0, feat_scale=90.0, feat_pwm=20.0,
-            clamp_near_stop=False,
+        # Heading correction — "mass" model.
+        # ζ = kd / (2√(m·kp)) = 0.05 / (2√(0.0003·2)) ≈ 1.0
+        self.pid_head = NeuroPID(
+            HEAD_KP, HEAD_KI, HEAD_KD,
+            out_min=-30, out_max= 30,
+            system_type="mass", target_zeta=1.0, zeta_weight=0.5,
+            mass=1.87, damping=0,
+            warmup_steps=200,
         )
-        self.head_pid   = NeuralPID()
-        self._last_corr = 0.0
 
-        # Distance → speed — the wall-approach loop (the forward leg).  mass=1.0,
-        # target ζ=0.9 (near-critically damped: fast approach, minimal overshoot
-        # into the wall).
-        self.dist_tuner = OnlineTuner(
-            train=True,
-            feat_stop=STOP_DIST, feat_scale=MAX_RANGE, feat_pwm=float(PWM_MAX),
-            target_zeta=0.9, zeta_band=ZETA_BAND_DIST,
+        # Distance → speed — Neuro1 MLP provides adaptive (kp, ki, kd).
+        # FeatureBuilder is re-created with our constants so the normalisation
+        # and safety-fallback threshold match the rest of the controller.
+        self.gain_tuner = OnlineTuner(train=True)
+        self.gain_tuner.feat = FeatureBuilder(
+            stop_dist=STOP_DIST,
+            max_range=MAX_RANGE,
+            pwm_max=float(PWM_MAX),
         )
-        self.dist_pid    = NeuralPID()
-        self._last_speed = float(MIN_PWM)
+        self.dist_pid   = _DistPID()      # stateful integrator driven by tuner
+        self._last_speed = float(MIN_PWM) # previous motor command for feature vector
 
-        # Turn — rotate to a target heading (closed on the gyro heading only).
-        # Target a slightly underdamped controller (ζ=0.8) to make turns
-        # responsive; SETTLE absorbs the small overshoot. Allow faster online
-        # gain changes (higher `max_rate`) so the tuner can respond aggressively
-        # during a turn.
-        self.turn_tuner = OnlineTuner(
-            train=True,
-            kp_range=(0.5, 8.0), ki_range=(0.0, 1.0), kd_range=(0.0, 2.0),
-            init_gains=(TURN_KP, TURN_KI, TURN_KD),
-            mass=0.06, target_zeta=0.8, zeta_band=ZETA_BAND_TURN,
-            feat_stop=0.0, feat_scale=180.0, feat_pwm=float(PWM_MAX),
-            clamp_near_stop=False,
+        # Turn angle — "mass" model, intentionally UNDERDAMPED (ζ ≈ 0.7).
+        # ζ = kd / (2√(m·kp)) = 0.48 / (2√(0.06·2)) ≈ 0.7
+        # ~5% overshoot but reaches the target much faster (no asymptotic crawl);
+        # the SETTLE state re-captures the true heading afterward, so the small
+        # overshoot self-corrects and costs nothing.
+        self.pid_turn = NeuroPID(
+            TURN_KP, TURN_KI, TURN_KD,
+            out_min=-PWM_MAX, out_max=PWM_MAX,
+            system_type="mass", target_zeta=0.85, zeta_weight=0.5,
+            mass=1.87, damping= 0,
+            warmup_steps=200,
         )
-        self.turn_pid   = NeuralPID()
-        self._last_turn = 0.0
-
-        # --- optional runtime logging of tuner outputs -----------------
-        if DEBUG_LOG:
-            try:
-                log_dir = os.path.join(os.getcwd(), "Yuval")
-                os.makedirs(log_dir, exist_ok=True)
-                log_path = os.path.join(log_dir, LOG_FILENAME)
-                first = not os.path.exists(log_path)
-                self._log_f = open(log_path, "a", newline="")
-                self._log_writer = csv.writer(self._log_f)
-                if first:
-                    self._log_writer.writerow([
-                        "ts", "state", "dist_front_m", "raw_speed", "ff", "speed",
-                        "kp_d","ki_d","kd_d","zeta_d",
-                        "kp_h","ki_h","kd_h","zeta_h",
-                        "kp_t","ki_t","kd_t","zeta_t",
-                        "correction","left","right",
-                    ])
-                    self._log_f.flush()
-            except Exception as e:
-                print("Warning: could not open tuner log:", e)
-                self._log_f = None
-                self._log_writer = None
-        else:
-            self._log_f = None
-            self._log_writer = None
 
         self._stop_motors()
         print("Calibrating gyro (5 s) — DO NOT MOVE ROBOT...")
@@ -294,11 +241,9 @@ class Robot(Node):
 
         # ── OPERATIONAL ───────────────────────────────────────────────────
         corrected = rate - self.drift_offset
-        # Suppress small gyro noise only when we're intentionally holding a
-        # heading. During a commanded turn (or any active rotation), slow
-        # rotation is signal and must not be zeroed out.
-        hold_heading_states = ("FORWARD", "WAIT", "DECIDE", "SETTLE", "INIT")
-        if self.state in hold_heading_states and abs(corrected) < GYRO_DEADBAND:
+        # slow rotation is noise while holding a heading, but it's signal during
+        # a TURN — zeroing it there makes the controller blind in the last degree.
+        if self.state != "TURN" and abs(corrected) < GYRO_DEADBAND:
             corrected = 0.0
         self.heading += corrected * dt
 
@@ -306,15 +251,6 @@ class Robot(Node):
     #   Front  → minimum of valid rays  (safety-critical: stop on any close ray)
     #   Left/Right → mean of valid rays (decision-making: average is noise-robust)
     def scan_cb(self, msg):
-        # During a commanded rotation the lidar is not used by the turn loop
-        # (turns are closed on the gyro heading only). Processing every ray here
-        # blocks the single-threaded executor, delaying imu_cb and the turn
-        # completion check, which makes the robot overshoot the target angle.
-        # Skip the work while TURNING; SETTLE (robot stationary) refreshes the
-        # forward distance again before the next FORWARD leg.
-        if self.state == "TURN":
-            return
-
         front_min  = float("inf")
         left_sum,  left_n  = 0.0, 0
         right_sum, right_n = 0.0, 0
@@ -366,61 +302,24 @@ class Robot(Node):
             else:
                 self.obstacle_count = 0
 
-            # ── Speed: MLP tunes (kp,ki,kd); dist_pid integrates the error
-            kp_d, ki_d, kd_d = self.dist_tuner.maybe_update(
+            # ── Speed: Neuro1 MLP tunes (kp,ki,kd); _DistPID integrates ────
+            kp, ki, kd = self.gain_tuner.maybe_update(
                 self.dist_front, self._last_speed, time.monotonic()
             )
             dist_err = self.dist_front - STOP_DIST
-            raw_speed = self.dist_pid.step(dist_err, kp_d, ki_d, kd_d)
-
-            # Feedforward from distance to boost mid-range speed (smoothly).
-            norm = clamp((self.dist_front - STOP_DIST) / (MAX_RANGE - STOP_DIST), 0.0, 1.0)
-            ff = MIN_PWM + (CRUISE_PWM - MIN_PWM) * (norm ** SPEED_FF_EXP)
-
-            speed = SPEED_FF_WEIGHT * ff + (1.0 - SPEED_FF_WEIGHT) * raw_speed
-            speed = clamp(speed, MIN_PWM, CRUISE_PWM)
+            speed = self.dist_pid.step(dist_err, kp, ki, kd)
+            speed = clamp(speed, MIN_PWM, PWM_MAX)
             self._last_speed = speed
 
-            # ── Heading: MLP tunes heading PID gains each loop
-            head_err = self.start_heading - heading
-            kp_h, ki_h, kd_h = self.head_tuner.maybe_update(
-                head_err, self._last_corr, time.monotonic()
-            )
-            correction = self.head_pid.step(head_err, kp_h, ki_h, kd_h)
-            self._last_corr = correction
+            # ── Heading: NeuroPID keeps the robot driving straight ────────
+            head_err   = self.start_heading - heading
+            correction = self.pid_head.step(head_err)
 
             left  = clamp(speed + correction, 0, PWM_MAX)
             right = clamp(speed - correction, 0, PWM_MAX)
             print(f"[FWD] dist={self.dist_front*100:.0f}cm  "
-                  f"kp={kp_d:.1f} ki={ki_d:.2f} kd={kd_d:.1f}  "
-                  f"speed={speed:.0f}% (pid={raw_speed:.0f} ff={ff:.0f})  "
+                  f"kp={kp:.1f} ki={ki:.2f} kd={kd:.1f}  speed={speed:.0f}%  "
                   f"steering={correction:+.0f}  L={left:.0f}%  R={right:.0f}%")
-
-            if DEBUG_LOG and getattr(self, "_log_writer", None):
-                try:
-                    zeta_d = kd_d / (2.0 * math.sqrt(max(kp_d + 0.1 * ki_d, 1e-9)))
-                    zeta_h = kd_h / (2.0 * math.sqrt(max(kp_h + 0.1 * ki_h, 1e-9)))
-                    if hasattr(self, "turn_tuner") and getattr(self.turn_tuner, "gains", None) is not None:
-                        tg = self.turn_tuner.gains
-                        kp_t = float(tg[0]); ki_t = float(tg[1]); kd_t = float(tg[2])
-                        zeta_t = kd_t / (2.0 * math.sqrt(max(kp_t + 0.1 * ki_t, 1e-9)))
-                    else:
-                        kp_t = ki_t = kd_t = zeta_t = 0.0
-                    ts = time.time()
-                    self._log_writer.writerow([
-                        ts, self.state, round(self.dist_front, 3), round(raw_speed, 3), round(ff, 3), round(speed, 3),
-                        round(kp_d, 3), round(ki_d, 3), round(kd_d, 3), round(zeta_d, 3),
-                        round(kp_h, 3), round(ki_h, 3), round(kd_h, 3), round(zeta_h, 3),
-                        round(kp_t, 3), round(ki_t, 3), round(kd_t, 3), round(zeta_t, 3),
-                        round(correction, 3), round(left, 3), round(right, 3),
-                    ])
-                    try:
-                        self._log_f.flush()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
             self._drive_forward(left, right)
             return
 
@@ -473,9 +372,9 @@ class Robot(Node):
                 # straight and re-evaluate at the next obstacle.
                 self.start_heading  = heading
                 self.obstacle_count = 0
-                self.head_pid.reset()
+                self.pid_head.reset()
                 self.dist_pid.reset()
-                self.dist_tuner.feat.reset()
+                self.gain_tuner.feat.reset()
                 self._last_speed = float(MIN_PWM)
                 self.state = "FORWARD"
                 print(f"  → Sides nearly equal (diff {abs(diff)*100:.0f}cm < "
@@ -485,7 +384,7 @@ class Robot(Node):
             # Arm the NeuroPID turn
             self.turn_target     = heading + delta
             self.turn_started_at = time.monotonic()
-            self.turn_pid.reset()
+            self.pid_turn.reset()
             self.state = "TURN"
             print(f"  → target heading = {self.turn_target:.1f}°")
             return
@@ -493,29 +392,13 @@ class Robot(Node):
         # ── TURN: NeuroPID-controlled rotation (90° or 180°) ─────────────
         if self.state == "TURN":
             error = wrap_angle(self.turn_target - heading)
-            elapsed = time.monotonic() - self.turn_started_at
 
-            # Completed: within 1° of target — but a turn must last at least
-            # TURN_MIN_TIME. If we've reached the target early, hold still
-            # (motors off) and stay in TURN until the minimum time elapses,
-            # then enter the settle pause.
+            # Completed: within 1° of target — enter settle pause
             if abs(error) < TURN_DONE_DEG:
-                if elapsed < TURN_MIN_TIME:
-                    self._stop_motors()
-                    return
                 self._stop_motors()
                 self.settle_until = time.monotonic() + SETTLE_SECONDS
                 self.state = "SETTLE"
-                print(f"Turn complete  (heading = {heading:.1f}°, {elapsed:.1f} s) — "
-                      f"settling for {SETTLE_SECONDS:.1f} s")
-                return
-
-            # Safety timeout — enter settle anyway so robot stabilises
-            if elapsed > TURN_TIMEOUT:
-                self._stop_motors()
-                self.settle_until = time.monotonic() + SETTLE_SECONDS
-                self.state = "SETTLE"
-                print(f"Turn timeout  (error = {error:.1f}°) — "
+                print(f"Turn complete  (heading = {heading:.1f}°) — "
                       f"settling for {SETTLE_SECONDS:.1f} s")
                 return
 
@@ -523,16 +406,10 @@ class Robot(Node):
             # At ≥20° away: floor = TURN_MIN_PWM.  At <20°: floor ramps toward 10%
             # so the robot decelerates instead of crashing through the setpoint.
             turn_min = clamp(int(TURN_MIN_PWM * abs(error) / 20.0), 10, TURN_MIN_PWM)
-            kp_t, ki_t, kd_t = self.turn_tuner.maybe_update(
-                error, self._last_turn, time.monotonic()
-            )
-            cmd = self.turn_pid.step(error, kp_t, ki_t, kd_t)
+            cmd = self.pid_turn.step(error, setpoint=self.turn_target)
             spd = clamp(abs(cmd), turn_min, PWM_MAX)
-            # enforce absolute minimum turn speed
-            spd = max(spd, TURN_MIN_PWM)
-            self._last_turn = spd
-            print(f"[TURN] err={error:+.1f}°  kp={kp_t:.1f} ki={ki_t:.2f} kd={kd_t:.1f} "
-                  f"cmd={cmd:+.1f}%  spd={spd:.0f}%")
+            spd = max(spd, TURN_MIN_PWM)   # enforce absolute minimum turn speed (37%)
+            print(f"[TURN] err={error:+.1f}°  cmd={cmd:+.1f}%  spd={spd:.0f}%")
             if cmd > 0:
                 self._turn_left(spd)
             else:
@@ -547,9 +424,9 @@ class Robot(Node):
                 # the new straight-ahead reference for the next forward leg.
                 self.start_heading  = heading
                 self.obstacle_count = 0
-                self.head_pid.reset()
+                self.pid_head.reset()
                 self.dist_pid.reset()
-                self.dist_tuner.feat.reset()
+                self.gain_tuner.feat.reset()
                 self._last_speed = float(MIN_PWM)
                 self.state = "FORWARD"
                 print(f"Settled  (heading = {heading:.1f}°) — resuming forward")
@@ -583,11 +460,6 @@ class Robot(Node):
         self._stop_motors()
         self.left_pwm.stop()
         self.right_pwm.stop()
-        if hasattr(self, "_log_f") and self._log_f:
-            try:
-                self._log_f.close()
-            except Exception:
-                pass
 
 
 
